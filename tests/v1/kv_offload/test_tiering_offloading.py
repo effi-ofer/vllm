@@ -536,6 +536,21 @@ class TestTieringOffloadingManager:
         job_metadata = self.secondary_tier1.submit_store.call_args.args[0]
         assert job_metadata.req_context is ctx
 
+    def test_req_context_propagated_to_submit_load(self, manager_setup):
+        """Test that req_context from lookup() is forwarded to submit_load."""
+        block = to_keys([0])[0]
+        self.secondary_tier1.blocks[block] = True  # simulate prior cascade
+
+        self.secondary_tier1.submit_load = MagicMock(
+            wraps=self.secondary_tier1.submit_load
+        )
+        ctx = ReqContext(kv_transfer_params={"priority": "high"})
+        self.manager.lookup(block, ctx)
+
+        self.secondary_tier1.submit_load.assert_called_once()
+        job_metadata = self.secondary_tier1.submit_load.call_args[0][0]
+        assert job_metadata.req_context.kv_transfer_params == {"priority": "high"}
+
 
 class TestTieringOffloadingWithoutSecondaryTiers:
     """Test TieringOffloadingManager with no secondary tiers (backward compat)."""
