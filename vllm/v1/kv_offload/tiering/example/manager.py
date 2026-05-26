@@ -64,6 +64,11 @@ class ExampleSecondaryTierManager(SecondaryTierManager):
         # Completed jobs waiting to be retrieved by get_finished()
         self.completed_jobs: list[JobResult] = []
 
+    def batch_lookup(
+        self, keys: list[OffloadKey], req_context: ReqContext
+    ) -> list[bool | None]:
+        return [k in self.blocks for k in keys]
+
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> bool | None:
         """
         Check whether a block exists in this secondary tier.

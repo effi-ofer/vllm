@@ -37,6 +37,10 @@ from vllm.v1.kv_offload.base import (
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
+from vllm.v1.kv_offload.tiering.async_lookup import (
+    NOT_FOUND,
+    AsyncLookupWorker,
+)
 from vllm.v1.kv_offload.tiering.base import (
     JobId,
     JobMetadata,
@@ -139,6 +143,11 @@ class TieringOffloadingManager(OffloadingManager):
 
         self._job_id_counter: int = 0
         self.events: list[OffloadingEvent] | None = [] if enable_events else None
+        self._async_lookup: AsyncLookupWorker | None = (
+            AsyncLookupWorker(self.secondary_tiers)
+            if self.secondary_tiers
+            else None
+        )
 
         # Job tracking: maps job_id to metadata for all in-flight transfers.
         # JobMetadata.is_promotion distinguishes direction:
@@ -211,6 +220,10 @@ class TieringOffloadingManager(OffloadingManager):
                     self.primary_tier.complete_read(
                         job_metadata.keys, job_metadata.req_context
                     )
+                    if self._async_lookup and completed_job.success:
+                        self._async_lookup.update_cached_exists(
+                            job_metadata.keys, tier_idx=i
+                        )
 
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> bool | None:
         """
@@ -241,19 +254,18 @@ class TieringOffloadingManager(OffloadingManager):
         if primary_hit is None:
             return None
 
-        any_none = False
-        for tier in self.secondary_tiers:
-            result = tier.lookup(key, req_context)
-            if result is True:
-                if not self._initiate_promotion(tier, key, req_context):
-                    return False  # primary full, block unavailable
-                return None  # promotion started, retry later
-            if result is None:
-                any_none = True
+        if not self._async_lookup:
+            return False
 
-        if any_none:
+        result = self._async_lookup.query(key, req_context)
+        if result is None:
             return None
-        return False
+        if result == NOT_FOUND:
+            return False
+        tier = self.secondary_tiers[result]
+        if not self._initiate_promotion(tier, key, req_context):
+            return False
+        return None
 
     def _initiate_promotion(
         self,
@@ -489,6 +501,9 @@ class TieringOffloadingManager(OffloadingManager):
 
         self._flush_pending_promotions()
 
+        if self._async_lookup:
+            self._async_lookup.notify_end_of_step()
+
         # Reset the per-step gate so next step's first call does real work.
         self._processed_jobs_this_step = False
 
@@ -500,6 +515,8 @@ class TieringOffloadingManager(OffloadingManager):
 
     def shutdown(self) -> None:
         """Shutdown all tiers and release resources."""
+        if self._async_lookup:
+            self._async_lookup.shutdown()
         for tier in self.secondary_tiers:
             tier.shutdown()
         self.primary_tier.shutdown()
