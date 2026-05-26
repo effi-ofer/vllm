@@ -151,6 +151,13 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
             logger.warning("lookup failed for key %s: %s", key, e)
             return False
 
+    def batch_lookup(
+        self, keys: list[OffloadKey], req_context: ReqContext
+    ) -> list[bool | None]:
+        # TODO: replace with a single query_memory() call using a dedicated
+        # _lookup_agent to avoid contention with the scheduler thread.
+        return [self.lookup(k, req_context) for k in keys]
+
     def submit_store(self, job_metadata: JobMetadata) -> None:
         obj_keys = (self._get_obj_key(k) for k in job_metadata.keys)
         self._submit_transfer(job_metadata.job_id, job_metadata.block_ids, obj_keys, NIXL_WRITE)
