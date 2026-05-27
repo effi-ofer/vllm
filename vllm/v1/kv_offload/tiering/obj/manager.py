@@ -25,6 +25,12 @@ NIXL_READ = "READ"
 NIXL_PROC = "PROC"
 NIXL_DONE = "DONE"
 
+# Constants for query_memory probes (existence checks).
+# _PROBE_DEV_ID=0 is reserved for probes; transfer dev_ids start from 1.
+_PROBE_ADDR: int = 0
+_PROBE_LEN: int = 1
+_PROBE_DEV_ID: int = 0
+
 class TransferEntry(NamedTuple):
     xfer_handle: nixl_xfer_handle
     files_desc: object
@@ -61,6 +67,10 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
         self._file_mapper = FileMapper.from_offloading_spec(root_dir, offloading_spec)
         self._next_obj_dev_id: int = 0  # unique devId for each OBJ registration
 
+        lookup_config = nixl_agent_config(backends=[])
+        self._lookup_agent = nixl_agent("ObjLookupAgent", lookup_config)
+        self._lookup_agent.create_backend("OBJ", params)
+
         self._probe_connectivity()
         self.set_primary_view(primary_kv_view)
 
@@ -91,7 +101,10 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
         self._stride = view.strides[0]
 
     def _exists(self, obj_key: str) -> bool:
-        return self._agent.query_memory([(0, 1, 0, obj_key)], "OBJ", "OBJ")[0] is not None
+        results = self._agent.query_memory(
+            [(_PROBE_ADDR, _PROBE_LEN, _PROBE_DEV_ID, obj_key)], "OBJ", "OBJ"
+        )
+        return results[0] is not None
 
     def _get_obj_key(self, key: OffloadKey) -> str:
         return self._file_mapper.get_file_name(key)
@@ -154,9 +167,12 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
     def batch_lookup(
         self, keys: list[OffloadKey], req_context: ReqContext
     ) -> list[bool | None]:
-        # TODO: replace with a single query_memory() call using a dedicated
-        # _lookup_agent to avoid contention with the scheduler thread.
-        return [self.lookup(k, req_context) for k in keys]
+        queries = [
+            (_PROBE_ADDR, _PROBE_LEN, i, self._get_obj_key(k))
+            for i, k in enumerate(keys)
+        ]
+        results = self._lookup_agent.query_memory(queries, "OBJ", "OBJ")
+        return [r is not None for r in results]
 
     def submit_store(self, job_metadata: JobMetadata) -> None:
         obj_keys = (self._get_obj_key(k) for k in job_metadata.keys)
@@ -200,6 +216,10 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
             except Exception as exc:
                 logger.warning("deregister_memory failed for job %d: %s", job_id, exc)
         self._transfers.clear()
+        try:
+            del self._lookup_agent
+        except Exception as exc:
+            logger.warning("failed to release lookup agent: %s", exc)
         if self._primary_reg is not None:
             try:
                 self._agent.deregister_memory(self._primary_reg)
