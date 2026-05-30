@@ -66,7 +66,6 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
         root_dir = f"{prefix}/" if prefix else ""
         self._file_mapper = FileMapper.from_offloading_spec(root_dir, offloading_spec)
         self._next_obj_dev_id: int = 0  # unique devId for each OBJ registration
-        self._stored_keys: set[str] = set()
 
         lookup_config = nixl_agent_config(backends=[])
         self._lookup_agent = nixl_agent("ObjLookupAgent", lookup_config)
@@ -168,12 +167,15 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
     def batch_lookup(
         self, keys: list[OffloadKey], req_context: ReqContext
     ) -> list[bool | None]:
-        return [self._get_obj_key(k) in self._stored_keys for k in keys]
+        queries = [
+            (_PROBE_ADDR, _PROBE_LEN, i, self._get_obj_key(k))
+            for i, k in enumerate(keys)
+        ]
+        results = self._lookup_agent.query_memory(queries, "OBJ", "OBJ")
+        return [r is not None for r in results]
 
     def submit_store(self, job_metadata: JobMetadata) -> None:
-        obj_keys = [self._get_obj_key(k) for k in job_metadata.keys]
-        for key in obj_keys:
-            self._stored_keys.add(key)
+        obj_keys = (self._get_obj_key(k) for k in job_metadata.keys)
         self._submit_transfer(job_metadata.job_id, job_metadata.block_ids, obj_keys, NIXL_WRITE)
 
     def submit_load(self, job_metadata: JobMetadata) -> None:
