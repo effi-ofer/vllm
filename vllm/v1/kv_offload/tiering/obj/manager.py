@@ -68,6 +68,8 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
         self._next_obj_dev_id: int = 0  # unique devId for each OBJ registration
 
         lookup_config = nixl_agent_config(backends=[])
+
+        # Create a dedicated nixl agent for the lookup to be thread safe.
         self._lookup_agent = nixl_agent("ObjLookupAgent", lookup_config)
         self._lookup_agent.create_backend("OBJ", params)
 
