@@ -163,6 +163,20 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
         self._transfers[job_id] = TransferEntry(xfer_handle, files_desc, obj_handle)
         return True
 
+    def batch_lookup(
+        self, keys: list[OffloadKey], req_context: ReqContext
+    ) -> list[bool | None]:
+        descriptors = [
+            (_PROBE_ADDR, _PROBE_LEN, _PROBE_DEV_ID, self._get_obj_key(k))
+            for k in keys
+        ]
+        try:
+            results = self._agent.query_memory(descriptors, "OBJ", "OBJ")
+            return [r is not None for r in results]
+        except Exception as e:
+            logger.warning("batch_lookup failed for %d keys: %s", len(keys), e)
+            return [False] * len(keys)
+
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> bool | None:
         try:
             return self._exists(self._get_obj_key(key))
