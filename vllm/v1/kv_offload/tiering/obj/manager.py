@@ -72,6 +72,12 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
         self._file_mapper = FileMapper.from_offloading_spec(root_dir, offloading_spec)
         self._next_obj_dev_id: int = 1  # dev_id=0 is reserved for _exists() probes
 
+        # Dedicated agent for batch_lookup (worker thread) to avoid contention
+        # with _agent which is used by the scheduler thread for transfers.
+        lookup_config = nixl_agent_config(backends=[])
+        self._lookup_agent = nixl_agent("ObjLookupAgent", lookup_config)
+        self._lookup_agent.create_backend("OBJ", params)
+
         self._probe_connectivity()
 
         base_addr = ctypes.addressof(ctypes.c_char.from_buffer(primary_kv_view))
@@ -171,7 +177,7 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
             for k in keys
         ]
         try:
-            results = self._agent.query_memory(descriptors, "OBJ", "OBJ")
+            results = self._lookup_agent.query_memory(descriptors, "OBJ", "OBJ")
             return [r is not None for r in results]
         except Exception as e:
             logger.warning("batch_lookup failed for %d keys: %s", len(keys), e)
@@ -231,6 +237,10 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
             except Exception as exc:
                 logger.warning("deregister_memory failed for job %d: %s", job_id, exc)
         self._transfers.clear()
+        try:
+            del self._lookup_agent
+        except Exception as exc:
+            logger.warning("failed to release lookup agent: %s", exc)
         if self._dram_prepped_handle is not None:
             try:
                 self._agent.release_dlist_handle(self._dram_prepped_handle)
