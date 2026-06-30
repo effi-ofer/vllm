@@ -314,9 +314,10 @@ class OffloadingConnectorWorker:
         assert self.worker is not None
         finished_recving: set[str] = set()
         for transfer_result in self.worker.get_finished():
-            # we currently do not support job failures
             job_id = transfer_result.job_id
-            assert transfer_result.success
+            if not transfer_result.success:
+                logger.warning("Transfer job %d failed", job_id)
+                continue
             is_load = job_id in self._load_jobs
             if (
                 transfer_result.transfer_time is not None

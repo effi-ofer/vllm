@@ -22,9 +22,13 @@ Key Design Principles:
 
 from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from typing_extensions import override
+
+if TYPE_CHECKING:
+    from vllm.v1.kv_offload.tiering.gds.common import GDSLoadStoreSpec
 
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     OffloadingConnectorStats,
@@ -140,6 +144,7 @@ class TieringOffloadingManager(OffloadingManager):
         primary_tier: CPUPrimaryTierOffloadingManager,
         secondary_tiers: list[SecondaryTierManager] | None = None,
         enable_events: bool = False,
+        gds_available: bool = False,
     ):
         """
         Initialize the TieringOffloadingManager.
@@ -149,6 +154,9 @@ class TieringOffloadingManager(OffloadingManager):
             secondary_tiers: List of secondary tier managers (e.g., Storage,
                             Network). Can be None or empty list.
             enable_events: Whether to track offloading events
+            gds_available: Whether GDS (GPU Direct Storage) is available.
+                When True, blocks found in a GDS-capable secondary tier
+                bypass CPU primary and transfer directly FS->GPU.
         """
         self.primary_tier: CPUPrimaryTierOffloadingManager = primary_tier
         self.secondary_tiers = secondary_tiers or []
@@ -178,6 +186,17 @@ class TieringOffloadingManager(OffloadingManager):
         # Secondary tiers are finalized only after pending primary stores reach
         # complete_store(), since complete_store() can still submit cascades.
         self._req_state: dict[str, RequestState] = {}
+
+        # GDS: keys staged for direct FS->GPU transfer, bypassing CPU primary.
+        # Keyed by req_id. Populated during lookup(), consumed in prepare_load().
+        self._gds_available: bool = gds_available
+        self._gds_ready_keys: dict[str, set[OffloadKey]] = {}
+        self._gds_tier: Any = None
+        if gds_available:
+            for tier in self.secondary_tiers:
+                if getattr(tier, "supports_gds", False):
+                    self._gds_tier = tier
+                    break
 
     def _next_job_id(self) -> JobId:
         """Generate a unique job ID for async transfer tracking."""
@@ -268,6 +287,10 @@ class TieringOffloadingManager(OffloadingManager):
         for tier in self.secondary_tiers:
             result = tier.lookup(key, req_context)
             if result is LookupResult.HIT:
+                if self._gds_available and tier is self._gds_tier:
+                    # GDS path: no CPU allocation, transfer happens on worker
+                    self._gds_ready_keys.setdefault(req_context.req_id, set()).add(key)
+                    return LookupResult.HIT
                 if not self._initiate_promotion(tier, key, req_context):
                     return LookupResult.MISS
                 return LookupResult.RETRY
@@ -351,28 +374,58 @@ class TieringOffloadingManager(OffloadingManager):
 
         self._pending_load_submissions.clear()
 
+    def _build_gds_spec(self, keys: Collection[OffloadKey]) -> "GDSLoadStoreSpec":
+        """Build a GDSLoadStoreSpec with file paths for the given keys."""
+        from vllm.v1.kv_offload.tiering.gds.common import GDSLoadStoreSpec
+
+        assert self._gds_tier is not None
+        file_paths = [self._gds_tier.get_file_path(key) for key in keys]
+        return GDSLoadStoreSpec(
+            file_paths=file_paths,
+            block_size_bytes=self._gds_tier.block_size,
+        )
+
     @override
     def prepare_load(
         self, keys: Collection[OffloadKey], req_context: ReqContext
     ) -> LoadStoreSpec:
         """
-        Prepare blocks to be loaded from primary tier to GPU.
+        Prepare blocks to be loaded from primary tier (or via GDS) to GPU.
 
         CRITICAL: This method calls _maybe_process_finished_jobs() FIRST to ensure
         that any completed promotions have been finalized and blocks are ready.
 
-        This increments ref_cnt on the blocks in the primary tier, protecting
-        them from eviction during the transfer.
+        When GDS is available and all keys are GDS-ready, returns a
+        GDSLoadStoreSpec with file paths. Otherwise returns CPULoadStoreSpec.
 
         Args:
             keys: Blocks to prepare for loading.
             req_context: Per-request context.
 
         Returns:
-            LoadStoreSpec for reading from primary tier.
+            LoadStoreSpec for reading from primary tier or GDS.
         """
         # Process completed promotions to ensure blocks are ready
         self._maybe_process_finished_jobs()
+
+        gds_set = self._gds_ready_keys.get(req_context.req_id)
+        if gds_set:
+            gds_keys = [k for k in keys if k in gds_set]
+            cpu_keys = [k for k in keys if k not in gds_set]
+
+            if gds_keys and not cpu_keys:
+                return self._build_gds_spec(gds_keys)
+            elif cpu_keys and not gds_keys:
+                return self.primary_tier.prepare_load(cpu_keys, req_context)
+            # Mixed: fall back to CPU path for all (rare in practice)
+            # GDS keys without CPU primary slots cannot go through CPU path,
+            # so we only load the CPU-ready keys here. The GDS keys will be
+            # retried on the next step after they fall out of _gds_ready_keys.
+            logger.warning(
+                "Mixed GDS/CPU keys for req %s; loading CPU keys only",
+                req_context.req_id,
+            )
+            return self.primary_tier.prepare_load(cpu_keys, req_context)
 
         return self.primary_tier.prepare_load(keys, req_context)
 
@@ -381,27 +434,42 @@ class TieringOffloadingManager(OffloadingManager):
         """
         Mark blocks as recently used in all tiers.
 
+        GDS-path keys are only touched in secondary tiers (they have no
+        primary tier allocation).
+
         Args:
             keys: Blocks to mark as recently used.
             req_context: Per-request context.
         """
-        self.primary_tier.touch(keys, req_context)
+        gds_set = self._gds_ready_keys.get(req_context.req_id)
+        if gds_set:
+            cpu_keys = [k for k in keys if k not in gds_set]
+            if cpu_keys:
+                self.primary_tier.touch(cpu_keys, req_context)
+        else:
+            self.primary_tier.touch(keys, req_context)
         for tier in self.secondary_tiers:
             tier.touch(keys, req_context)
 
     @override
     def complete_load(self, keys: Collection[OffloadKey], req_context: ReqContext):
         """
-        Mark blocks as done loading from primary tier to GPU.
+        Mark blocks as done loading to GPU.
 
-        This decrements ref_cnt on the blocks in the primary tier, allowing
-        them to be evicted again.
+        For CPU-path keys, decrements ref_cnt on primary tier blocks.
+        GDS-path keys have no primary tier allocation, so they are skipped.
 
         Args:
             keys: Blocks that finished loading.
             req_context: Per-request context.
         """
-        self.primary_tier.complete_load(keys, req_context)
+        gds_set = self._gds_ready_keys.pop(req_context.req_id, None)
+        if gds_set:
+            cpu_keys = [k for k in keys if k not in gds_set]
+            if cpu_keys:
+                self.primary_tier.complete_load(cpu_keys, req_context)
+        else:
+            self.primary_tier.complete_load(keys, req_context)
 
     @override
     def prepare_store(
@@ -580,6 +648,7 @@ class TieringOffloadingManager(OffloadingManager):
 
     @override
     def on_request_finished(self, req_context: ReqContext) -> None:
+        self._gds_ready_keys.pop(req_context.req_id, None)
         self.primary_tier.on_request_finished(req_context)
         state = self._req_state[req_context.req_id]
         state.is_finished = True
@@ -678,6 +747,7 @@ class TieringOffloadingManager(OffloadingManager):
         for req_id in finished_req_ids:
             del self._req_state[req_id]
         self._processed_jobs_this_step = False
+        self._gds_ready_keys.clear()
 
     @override
     def get_stats(self) -> OffloadingConnectorStats | None:

@@ -132,6 +132,17 @@ class FileSystemTierManager(SecondaryTierManager):
 
         self._lookup_manager = FsAsyncLookupManager(tier=self, tier_type=self.tier_type)
 
+    @property
+    def supports_gds(self) -> bool:
+        return True
+
+    @property
+    def block_size(self) -> int:
+        return self._block_size
+
+    def get_file_path(self, key: OffloadKey) -> str:
+        return self.file_mapper.get_file_name(key)
+
     @override
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
         return RequestOffloadingContext()

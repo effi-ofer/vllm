@@ -43,6 +43,7 @@ from vllm.v1.kv_offload.base import (
     CanonicalKVCaches,
     OffloadingManager,
     OffloadingMetricMetadata,
+    OffloadingWorker,
 )
 from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
@@ -104,6 +105,9 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
         self.secondary_tier_configs = self.extra_config.get("secondary_tiers", [])
         if not isinstance(self.secondary_tier_configs, list):
             raise ValueError("secondary_tiers must be a list of tier configurations")
+
+        # GDS (GPU Direct Storage) configuration
+        self._gds_enabled: bool = bool(self.extra_config.get("gds_enabled", False))
 
         # Scheduler-side mmap (rank=None); kept for cleanup
         self._scheduler_mmap: SharedOffloadRegion | None = None
@@ -169,6 +173,7 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                 primary_tier=primary_tier,
                 secondary_tiers=secondary_tiers,
                 enable_events=self.kv_events_config.enable_kv_cache_events,
+                gds_available=self._gds_enabled,
             )
             if int(self.extra_config.get("store_threshold", 0)) >= 2:
                 raise ValueError(
@@ -187,7 +192,9 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
         return self._manager
 
     @override
-    def create_worker(self, kv_caches: CanonicalKVCaches) -> CPUOffloadingWorker:
+    def create_worker(  # type: ignore[override]  # TODO: fix return type
+        self, kv_caches: CanonicalKVCaches
+    ) -> "OffloadingWorker":
         rank = torch.accelerator.current_device_index()
         worker_mmap = SharedOffloadRegion(
             instance_id=self.vllm_config.instance_id,
@@ -196,9 +203,21 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
             kv_bytes_per_block=self.kv_bytes_per_offloaded_block,
             cpu_page_size=self.cpu_page_size_per_worker,
         )
-        return CPUOffloadingWorker(
+        cpu_worker = CPUOffloadingWorker(
             kv_caches=kv_caches,
             block_size_factor=self.block_size_factor,
             num_cpu_blocks=self.num_blocks,
             mmap_region=worker_mmap,
         )
+        if self._gds_enabled:
+            from vllm.v1.kv_offload.tiering.gds.worker import (
+                GDSCapableOffloadingWorker,
+                GDSOffloadingHandler,
+            )
+
+            gds_handler = GDSOffloadingHandler(
+                kv_caches=kv_caches,
+                block_size_factor=self.block_size_factor,
+            )
+            return GDSCapableOffloadingWorker(cpu_worker, gds_handler)
+        return cpu_worker
