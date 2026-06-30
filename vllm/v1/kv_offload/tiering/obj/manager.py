@@ -73,27 +73,25 @@ class ObjAsyncLookupManager(AsyncLookupManager):
     ) -> Iterable[bool]:
         """Check Redis for key existence instead of querying object store."""
         obj_keys = [self._tier._file_mapper.get_file_name(k) for k in keys]
-        try:
-            # Use Redis pipeline for efficient batch lookup
-            pipe = self._tier._redis_client.pipeline()
-            for obj_key in obj_keys:
-                pipe.exists(obj_key)
-            results = pipe.execute()
-            return (bool(r) for r in results)
-        except Exception as exc:
-            logger.warning(
-                "Redis batch_lookup failed for %d keys: %s. "
-                "Falling back to object store query.",
-                len(keys),
-                exc,
-            )
-            # Fallback to object store query if Redis fails
-            descriptors = [
-                (_PROBE_ADDR, _PROBE_LEN, _PROBE_DEV_ID, obj_key)
-                for obj_key in obj_keys
-            ]
-            results = self._tier._agent.query_memory(descriptors, "OBJ", "OBJ")
-            return (r is not None for r in results)
+        if self._tier._redis_client is not None:
+            try:
+                pipe = self._tier._redis_client.pipeline()
+                for obj_key in obj_keys:
+                    pipe.exists(obj_key)
+                results = pipe.execute()
+                return (bool(r) for r in results)
+            except Exception as exc:
+                logger.warning(
+                    "Redis batch_lookup failed for %d keys: %s",
+                    len(keys),
+                    exc,
+                )
+        # Fallback to object store query
+        descriptors = [
+            (_PROBE_ADDR, _PROBE_LEN, _PROBE_DEV_ID, obj_key) for obj_key in obj_keys
+        ]
+        results = self._tier._agent.query_memory(descriptors, "OBJ", "OBJ")
+        return (r is not None for r in results)
 
 
 class ObjectStoreSecondaryTierManager(SecondaryTierManager):
