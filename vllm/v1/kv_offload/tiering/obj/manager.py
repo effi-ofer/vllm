@@ -7,6 +7,8 @@ import time
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, NamedTuple
 
+import redis
+
 from vllm.distributed.nixl_utils import NixlWrapper as nixl_agent
 from vllm.distributed.nixl_utils import nixl_agent_config
 from vllm.logger import init_logger
@@ -54,8 +56,8 @@ class TransferEntry(NamedTuple):
 class ObjAsyncLookupManager(AsyncLookupManager):
     """Async lookup manager for ObjectStoreSecondaryTierManager.
 
-    Batches existence probes into a single query_memory() call so the
-    background thread issues one round-trip per step instead of one per key.
+    Uses Redis to check for key existence instead of querying the object store
+    directly, providing faster lookups.
     """
 
     def __init__(
@@ -69,17 +71,29 @@ class ObjAsyncLookupManager(AsyncLookupManager):
     def batch_lookup(
         self, keys: list[OffloadKey], req_context: ReqContext
     ) -> Iterable[bool]:
-        descriptors = [
-            (
-                _PROBE_ADDR,
-                _PROBE_LEN,
-                _PROBE_DEV_ID,
-                self._tier._file_mapper.get_file_name(k),
+        """Check Redis for key existence instead of querying object store."""
+        obj_keys = [self._tier._file_mapper.get_file_name(k) for k in keys]
+        try:
+            # Use Redis pipeline for efficient batch lookup
+            pipe = self._tier._redis_client.pipeline()
+            for obj_key in obj_keys:
+                pipe.exists(obj_key)
+            results = pipe.execute()
+            return (bool(r) for r in results)
+        except Exception as exc:
+            logger.warning(
+                "Redis batch_lookup failed for %d keys: %s. "
+                "Falling back to object store query.",
+                len(keys),
+                exc,
             )
-            for k in keys
-        ]
-        results = self._tier._agent.query_memory(descriptors, "OBJ", "OBJ")
-        return (r is not None for r in results)
+            # Fallback to object store query if Redis fails
+            descriptors = [
+                (_PROBE_ADDR, _PROBE_LEN, _PROBE_DEV_ID, obj_key)
+                for obj_key in obj_keys
+            ]
+            results = self._tier._agent.query_memory(descriptors, "OBJ", "OBJ")
+            return (r is not None for r in results)
 
 
 class ObjectStoreSecondaryTierManager(SecondaryTierManager):
@@ -97,6 +111,9 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
         store_config: dict,
         prefix: str = "",
         io_threads: int = 4,
+        redis_host: str = "10.43.188.79",
+        redis_port: int = 6379,
+        redis_db: int = 0,
     ):
         super().__init__(offloading_spec, primary_kv_view, tier_type)
         agent_config = nixl_agent_config(backends=[])
@@ -109,6 +126,8 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
         # submission-time failures + poll-time completions accumulated
         # during drain_jobs().
         self._pending_results: list[JobResult] = []
+        # Track job_id -> keys mapping for Redis updates on successful stores
+        self._job_keys: dict[int, list[str]] = {}
         self._primary_reg = None
         self._block_size_bytes: int = 0
         root_dir = f"{prefix}/" if prefix else ""
@@ -117,6 +136,34 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
             root_dir, offloading_spec, parallel_agnostic=True
         )
         self._next_obj_dev_id: int = 1  # dev_id=0 is reserved for _exists() probes
+
+        # Initialize Redis client for async lookup
+        try:
+            self._redis_client = redis.Redis(
+                host=redis_host,
+                port=redis_port,
+                db=redis_db,
+                decode_responses=True,
+                socket_connect_timeout=5,
+                socket_timeout=5,
+            )
+            # Test connection
+            self._redis_client.ping()
+            logger.info(
+                "Redis client initialized successfully at %s:%d (db=%d)",
+                redis_host,
+                redis_port,
+                redis_db,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to initialize Redis client at %s:%d: %s. "
+                "Lookups will fall back to object store queries.",
+                redis_host,
+                redis_port,
+                exc,
+            )
+            self._redis_client = None
 
         self._probe_connectivity()
 
@@ -228,7 +275,9 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
         return LookupResult.HIT if result else LookupResult.MISS
 
     def submit_store(self, job_metadata: JobMetadata) -> None:
-        obj_keys = (self._file_mapper.get_file_name(k) for k in job_metadata.keys)
+        obj_keys = [self._file_mapper.get_file_name(k) for k in job_metadata.keys]
+        # Track keys for this job so we can update Redis on success
+        self._job_keys[job_metadata.job_id] = obj_keys
         self._submit_transfer(
             job_metadata.job_id, job_metadata.block_ids, obj_keys, NIXL_WRITE
         )
@@ -276,6 +325,33 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
         self._poll_active_transfers()
         results = self._pending_results
         self._pending_results = []
+
+        # Update Redis with keys from successful store operations
+        if self._redis_client is not None:
+            for result in results:
+                if result.success and result.job_id in self._job_keys:
+                    obj_keys = self._job_keys.pop(result.job_id)
+                    try:
+                        # Use pipeline for efficient batch insert
+                        pipe = self._redis_client.pipeline()
+                        for obj_key in obj_keys:
+                            pipe.set(obj_key, "1")
+                        pipe.execute()
+                        logger.debug(
+                            "Stored %d keys in Redis for job %d",
+                            len(obj_keys),
+                            result.job_id,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to store keys in Redis for job %d: %s",
+                            result.job_id,
+                            exc,
+                        )
+                elif result.job_id in self._job_keys:
+                    # Clean up tracking for failed jobs
+                    del self._job_keys[result.job_id]
+
         return results
 
     def drain_jobs(self) -> None:
@@ -332,3 +408,10 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
             except Exception as exc:
                 logger.warning("failed to deregister primary buffer: %s", exc)
             self._primary_reg = None
+        if self._redis_client is not None:
+            try:
+                self._redis_client.close()
+                logger.info("Redis client closed successfully")
+            except Exception as exc:
+                logger.warning("failed to close Redis client: %s", exc)
+            self._redis_client = None
