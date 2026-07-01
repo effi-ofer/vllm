@@ -53,7 +53,7 @@ class GDSOffloadingHandler:
     ):
         agent_config = nixl_agent_config(backends=[])
         self._agent = NixlWrapper("GDSAgent", agent_config)
-        self._agent.create_backend("FILE", {})
+        self._agent.create_backend("GDS", {})
 
         self._block_size_factor = block_size_factor
         self._transfers: dict[int, _GDSTransferEntry] = {}
@@ -131,7 +131,7 @@ class GDSOffloadingHandler:
         ]
         self._next_file_dev_id += len(file_descs)
 
-        file_reg = self._agent.register_memory(file_descs, "FILE")
+        file_reg = self._agent.register_memory(file_descs, "GDS")
         if file_reg is None:
             logger.warning("GDS register_memory failed for job %d", job_id)
             self._pending_results.append(TransferResult(job_id=job_id, success=False))
