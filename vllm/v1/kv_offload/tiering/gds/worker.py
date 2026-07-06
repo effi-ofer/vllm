@@ -51,7 +51,7 @@ class GDSOffloadingHandler:
         kv_caches: CanonicalKVCaches,
         block_size_factor: int,
     ):
-        agent_config = nixl_agent_config(backends=[])
+        agent_config = nixl_agent_config(backends=["GDS"])
         self._agent = NixlWrapper("GDSAgent", agent_config)
         self._agent.create_backend("GDS", {})
 
