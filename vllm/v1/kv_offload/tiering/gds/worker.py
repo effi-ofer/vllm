@@ -130,6 +130,16 @@ class GDSOffloadingHandler:
         ]
         self._next_file_dev_id += len(file_descs)
 
+        # Debug: Log file paths and check existence
+        logger.debug("GDS registering %d files for job %d:", len(file_descs), job_id)
+        for offset, size, dev_id, path in file_descs:
+            import os
+
+            exists = os.path.exists(path)
+            logger.debug(
+                "  dev_id=%d, path=%s, exists=%s, size=%d", dev_id, path, exists, size
+            )
+
         file_reg = self._agent.register_memory(file_descs, "FILE")
         if file_reg is None:
             logger.warning("GDS register_memory failed for job %d", job_id)
