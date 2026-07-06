@@ -53,7 +53,6 @@ class GDSOffloadingHandler:
     ):
         agent_config = nixl_agent_config(backends=["GDS"])
         self._agent = NixlWrapper("GDSAgent", agent_config)
-        self._agent.create_backend("GDS", {})
 
         self._block_size_factor = block_size_factor
         self._transfers: dict[int, _GDSTransferEntry] = {}
