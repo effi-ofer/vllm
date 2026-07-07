@@ -6,8 +6,12 @@ Handles FS->GPU transfers using NIXL's GDS backend with VRAM descriptors,
 bypassing CPU memory entirely.
 """
 
+import os
 import time
 from typing import TYPE_CHECKING, NamedTuple
+
+import numpy as np
+import torch
 
 from vllm.distributed.nixl_utils import NixlWrapper, nixl_agent_config
 from vllm.logger import init_logger
@@ -36,6 +40,7 @@ class _GDSTransferEntry(NamedTuple):
     xfer_handle: "nixl_xfer_handle"
     file_reg: object
     file_handle: "nixl_prepped_dlist_handle"
+    fds: list[int]
 
 
 class GDSOffloadingHandler:
@@ -63,7 +68,6 @@ class GDSOffloadingHandler:
 
     def _register_vram(self, kv_caches: CanonicalKVCaches) -> None:
         """Register GPU KV cache tensors as VRAM with NIXL."""
-        import torch
 
         self._gpu_tensors: list[torch.Tensor] = []
         self._gpu_page_sizes: list[int] = []
@@ -122,27 +126,17 @@ class GDSOffloadingHandler:
             len(gds_spec.file_paths),
             gds_spec.block_size_bytes,
         )
-        # Register FILE descriptors for source files.
-        # Each file is one block. dev_id must be unique per descriptor.
-        file_descs = [
-            (0, gds_spec.block_size_bytes, dev_id, path)
-            for dev_id, path in enumerate(gds_spec.file_paths, self._next_file_dev_id)
-        ]
-        self._next_file_dev_id += len(file_descs)
 
-        # Debug: Log file paths and check existence
-        logger.debug("GDS registering %d files for job %d:", len(file_descs), job_id)
-        for offset, size, dev_id, path in file_descs:
-            import os
-
-            exists = os.path.exists(path)
-            logger.debug(
-                "  dev_id=%d, path=%s, exists=%s, size=%d", dev_id, path, exists, size
-            )
+        # Open files and register with NIXL using file descriptors.
+        # The GDS backend requires actual fds, not path strings.
+        fds = [os.open(path, os.O_RDONLY) for path in gds_spec.file_paths]
+        file_descs = [(0, gds_spec.block_size_bytes, fd, "") for fd in fds]
 
         file_reg = self._agent.register_memory(file_descs, "FILE")
         if file_reg is None:
             logger.warning("GDS register_memory failed for job %d", job_id)
+            for fd in fds:
+                os.close(fd)
             self._pending_results.append(TransferResult(job_id=job_id, success=False))
             return False
 
@@ -150,14 +144,11 @@ class GDSOffloadingHandler:
         if not file_handle:
             logger.warning("GDS prep_xfer_dlist failed for job %d", job_id)
             self._agent.deregister_memory(file_reg)
+            for fd in fds:
+                os.close(fd)
             self._pending_results.append(TransferResult(job_id=job_id, success=False))
             return False
 
-        # Compute VRAM descriptor IDs from GPU block IDs.
-        # GPU block IDs are in gpu_spec.block_ids. With block_size_factor,
-        # consecutive GPU blocks map to the same offloaded block.
-        # VRAM descriptors are indexed as:
-        #   tensor_idx * blocks_per_tensor + offloaded_block_id
         vram_ids = self._compute_vram_ids(gpu_spec)
         file_ids = list(range(len(gds_spec.file_paths)))
 
@@ -172,6 +163,8 @@ class GDSOffloadingHandler:
             logger.warning("GDS make_prepped_xfer failed for job %d", job_id)
             self._agent.release_dlist_handle(file_handle)
             self._agent.deregister_memory(file_reg)
+            for fd in fds:
+                os.close(fd)
             self._pending_results.append(TransferResult(job_id=job_id, success=False))
             return False
 
@@ -181,10 +174,14 @@ class GDSOffloadingHandler:
             self._agent.release_xfer_handle(xfer_handle)
             self._agent.release_dlist_handle(file_handle)
             self._agent.deregister_memory(file_reg)
+            for fd in fds:
+                os.close(fd)
             self._pending_results.append(TransferResult(job_id=job_id, success=False))
             return False
 
-        self._transfers[job_id] = _GDSTransferEntry(xfer_handle, file_reg, file_handle)
+        self._transfers[job_id] = _GDSTransferEntry(
+            xfer_handle, file_reg, file_handle, fds
+        )
         return True
 
     def _compute_vram_ids(self, gpu_spec: GPULoadStoreSpec) -> list[int]:
@@ -194,8 +191,6 @@ class GDSOffloadingHandler:
         offloaded block. The VRAM descriptors are at offloaded-block
         granularity. We deduplicate and return unique offloaded block indices.
         """
-        import numpy as np
-
         block_ids = gpu_spec.block_ids
         if self._block_size_factor == 1:
             return block_ids.tolist()
@@ -236,6 +231,8 @@ class GDSOffloadingHandler:
             self._agent.release_xfer_handle(entry.xfer_handle)
             self._agent.release_dlist_handle(entry.file_handle)
             self._agent.deregister_memory(entry.file_reg)
+            for fd in entry.fds:
+                os.close(fd)
             self._pending_results.append(TransferResult(job_id=job_id, success=success))
 
     def has_pending(self) -> bool:
@@ -258,6 +255,9 @@ class GDSOffloadingHandler:
                 self._agent.release_dlist_handle(entry.file_handle)
             with contextlib.suppress(Exception):
                 self._agent.deregister_memory(entry.file_reg)
+            for fd in entry.fds:
+                with contextlib.suppress(Exception):
+                    os.close(fd)
         self._transfers.clear()
         if self._vram_prepped_handle is not None:
             with contextlib.suppress(Exception):
