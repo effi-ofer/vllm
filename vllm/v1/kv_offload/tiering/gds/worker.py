@@ -94,16 +94,20 @@ class GDSOffloadingHandler:
         self._vram_reg = self._agent.register_memory(vram_data, "VRAM")
 
         # Build per-block VRAM descriptors for transfer.
-        # Each block in the GPU tensor is one descriptor.
-        # With block_size_factor > 1, one offloaded block maps to multiple
-        # GPU blocks, so we use the offloaded block stride.
+        # Each offloaded block on disk contains data for ALL tensors
+        # concatenated. We register one VRAM descriptor per (tensor, block)
+        # pair. Layout: tensor0_block0, tensor0_block1, ..., tensor1_block0, ...
         blocks_data: list[tuple[int, int, int]] = []
         self._num_gpu_blocks = self._gpu_tensors[0].shape[0]
         device_id = self._gpu_tensors[0].device.index
+        self._num_tensors = len(self._gpu_tensors)
 
+        # Per-tensor offloaded page sizes (for file offset calculation)
+        self._offloaded_page_sizes: list[int] = []
         for t in self._gpu_tensors:
             gpu_page_size = t.shape[1]
             offloaded_page_size = gpu_page_size * self._block_size_factor
+            self._offloaded_page_sizes.append(offloaded_page_size)
             num_offloaded_blocks = t.shape[0] // self._block_size_factor
             for block_id in range(num_offloaded_blocks):
                 offset = block_id * offloaded_page_size
@@ -133,9 +137,19 @@ class GDSOffloadingHandler:
         )
 
         # Open files and register with NIXL using file descriptors.
-        # The GDS backend requires actual fds, not path strings.
+        # Each file contains data for ALL tensors concatenated. We register
+        # one FILE descriptor per (file, tensor) pair with the correct offset.
         fds = [os.open(path, os.O_RDONLY) for path in gds_spec.file_paths]
-        file_descs = [(0, gds_spec.block_size_bytes, fd, "") for fd in fds]
+        num_files = len(gds_spec.file_paths)
+
+        # Build FILE descriptors: for each file, one per tensor at the
+        # correct offset within the file.
+        file_descs = []
+        for fd in fds:
+            file_offset = 0
+            for tensor_page_size in self._offloaded_page_sizes:
+                file_descs.append((file_offset, tensor_page_size, fd, ""))
+                file_offset += tensor_page_size
 
         file_reg = self._agent.register_memory(file_descs, "FILE")
         if file_reg is None:
@@ -154,9 +168,19 @@ class GDSOffloadingHandler:
             self._pending_results.append(TransferResult(job_id=job_id, success=False))
             return False
 
-        num_files = len(gds_spec.file_paths)
+        # Build matched ID lists: for each file, pair each tensor's FILE
+        # descriptor with the corresponding VRAM descriptor.
         vram_ids = self._compute_vram_ids(gpu_spec, num_files)
-        file_ids = list(range(num_files))
+        file_ids = list(range(num_files * self._num_tensors))
+        # Expand vram_ids: for each offloaded block, add IDs for all tensors.
+        # VRAM layout: tensor0 blocks [0..N-1], tensor1 blocks [N..2N-1], ...
+        expanded_vram_ids = []
+        for block_id in vram_ids:
+            for tensor_idx in range(self._num_tensors):
+                expanded_vram_ids.append(
+                    tensor_idx * self._blocks_per_tensor + block_id
+                )
+        vram_ids = expanded_vram_ids
 
         xfer_handle = self._agent.make_prepped_xfer(
             NIXL_READ,
