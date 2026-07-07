@@ -67,6 +67,12 @@ class GDSOffloadingHandler:
 
     def _register_vram(self, kv_caches: CanonicalKVCaches) -> None:
         """Register GPU KV cache tensors as VRAM with NIXL."""
+        logger.info(
+            "GDS _register_vram: %d tensors, page_sizes=%s, bsf=%d",
+            len(kv_caches.tensors),
+            [t.page_size_bytes for t in kv_caches.tensors],
+            self._block_size_factor,
+        )
 
         self._gpu_tensors: list[torch.Tensor] = []
         self._gpu_page_sizes: list[int] = []
