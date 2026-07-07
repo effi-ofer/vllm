@@ -10,7 +10,6 @@ import os
 import time
 from typing import TYPE_CHECKING, NamedTuple
 
-import numpy as np
 import torch
 
 from vllm.distributed.nixl_utils import NixlWrapper, nixl_agent_config
@@ -149,8 +148,9 @@ class GDSOffloadingHandler:
             self._pending_results.append(TransferResult(job_id=job_id, success=False))
             return False
 
-        vram_ids = self._compute_vram_ids(gpu_spec)
-        file_ids = list(range(len(gds_spec.file_paths)))
+        num_files = len(gds_spec.file_paths)
+        vram_ids = self._compute_vram_ids(gpu_spec, num_files)
+        file_ids = list(range(num_files))
 
         xfer_handle = self._agent.make_prepped_xfer(
             NIXL_READ,
@@ -184,24 +184,32 @@ class GDSOffloadingHandler:
         )
         return True
 
-    def _compute_vram_ids(self, gpu_spec: GPULoadStoreSpec) -> list[int]:
+    def _compute_vram_ids(
+        self, gpu_spec: GPULoadStoreSpec, num_files: int
+    ) -> list[int]:
         """Map GPU block IDs to VRAM descriptor indices.
 
         With block_size_factor > 1, multiple GPU blocks correspond to one
         offloaded block. The VRAM descriptors are at offloaded-block
-        granularity. We deduplicate and return unique offloaded block indices.
+        granularity. We deduplicate and return unique offloaded block indices,
+        matching the number of files being transferred.
         """
         block_ids = gpu_spec.block_ids
         if self._block_size_factor == 1:
-            return block_ids.tolist()
+            return block_ids[:num_files].tolist()
 
-        # Map GPU block IDs to offloaded block IDs
+        # Map GPU block IDs to offloaded block IDs and deduplicate
         offloaded_ids = block_ids // self._block_size_factor
-        # For multi-tensor setups, offset by tensor index
-        # (For now assume single tensor — extend later if needed)
-        _, unique_indices = np.unique(offloaded_ids, return_index=True)
-        unique_indices.sort()
-        return offloaded_ids[unique_indices].tolist()
+        seen: set[int] = set()
+        result: list[int] = []
+        for oid in offloaded_ids:
+            oid_int = int(oid)
+            if oid_int not in seen:
+                seen.add(oid_int)
+                result.append(oid_int)
+                if len(result) == num_files:
+                    break
+        return result
 
     def get_finished(self) -> list[TransferResult]:
         """Poll pending GDS transfers for completion."""
