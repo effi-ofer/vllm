@@ -122,6 +122,7 @@ class GDSOffloadingHandler:
             self._gpu_tensors[0].shape[0] // self._block_size_factor
         )
 
+    # TODO: handle GDS failures rather than assert
     def submit_load(
         self,
         job_id: int,
@@ -152,21 +153,10 @@ class GDSOffloadingHandler:
                 file_offset += tensor_page_size
 
         file_reg = self._agent.register_memory(file_descs, "FILE")
-        if file_reg is None:
-            logger.warning("GDS register_memory failed for job %d", job_id)
-            for fd in fds:
-                os.close(fd)
-            self._pending_results.append(TransferResult(job_id=job_id, success=False))
-            return False
+        assert file_reg is not None, f"GDS register_memory failed for job {job_id}"
 
         file_handle = self._agent.prep_xfer_dlist("GDSAgent", file_reg.trim())
-        if not file_handle:
-            logger.warning("GDS prep_xfer_dlist failed for job %d", job_id)
-            self._agent.deregister_memory(file_reg)
-            for fd in fds:
-                os.close(fd)
-            self._pending_results.append(TransferResult(job_id=job_id, success=False))
-            return False
+        assert file_handle, f"GDS prep_xfer_dlist failed for job {job_id}"
 
         # Build matched ID lists: for each file, pair each tensor's FILE
         # descriptor with the corresponding VRAM descriptor.
@@ -189,25 +179,10 @@ class GDSOffloadingHandler:
             file_handle,
             file_ids,
         )
-        if not xfer_handle:
-            logger.warning("GDS make_prepped_xfer failed for job %d", job_id)
-            self._agent.release_dlist_handle(file_handle)
-            self._agent.deregister_memory(file_reg)
-            for fd in fds:
-                os.close(fd)
-            self._pending_results.append(TransferResult(job_id=job_id, success=False))
-            return False
+        assert xfer_handle, f"GDS make_prepped_xfer failed for job {job_id}"
 
         state = self._agent.transfer(xfer_handle)
-        if state == "ERR":
-            logger.warning("GDS transfer failed for job %d", job_id)
-            self._agent.release_xfer_handle(xfer_handle)
-            self._agent.release_dlist_handle(file_handle)
-            self._agent.deregister_memory(file_reg)
-            for fd in fds:
-                os.close(fd)
-            self._pending_results.append(TransferResult(job_id=job_id, success=False))
-            return False
+        assert state != "ERR", f"GDS transfer failed for job {job_id}"
 
         self._transfers[job_id] = _GDSTransferEntry(
             xfer_handle, file_reg, file_handle, fds
@@ -253,18 +228,18 @@ class GDSOffloadingHandler:
             try:
                 state = self._agent.check_xfer_state(entry.xfer_handle)
             except Exception as exc:
-                success = False
-                logger.warning(
-                    "GDS check_xfer_state raised for job %d: %s", job_id, exc
-                )
+                raise RuntimeError(
+                    f"GDS check_xfer_state raised for job {job_id}"
+                ) from exc
             else:
                 if state == NIXL_PROC:
                     continue
                 elif state == NIXL_DONE:
                     success = True
                 else:
-                    success = False
-                    logger.warning("GDS transfer failed job=%d state=%s", job_id, state)
+                    raise RuntimeError(
+                        f"GDS transfer failed job={job_id} state={state}"
+                    )
             del self._transfers[job_id]
             self._agent.release_xfer_handle(entry.xfer_handle)
             self._agent.release_dlist_handle(entry.file_handle)
