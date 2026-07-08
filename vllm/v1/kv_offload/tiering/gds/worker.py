@@ -151,6 +151,7 @@ class GDSOffloadingHandler:
         fds = [os.open(path, os.O_RDONLY) for path in gds_spec.file_paths]
         num_files = len(gds_spec.file_paths)
 
+        logger.debug("submit_load 1")
         # Build FILE descriptors: for each file, one per tensor at the
         # correct offset within the file.
         file_descs = []
@@ -160,16 +161,20 @@ class GDSOffloadingHandler:
                 file_descs.append((file_offset, tensor_page_size, fd, ""))
                 file_offset += tensor_page_size
 
+        logger.debug("submit_load 2")
         file_reg = self._agent.register_memory(file_descs, "FILE")
         assert file_reg is not None, f"GDS register_memory failed for job {job_id}"
+        logger.debug("submit_load 3")
 
         file_handle = self._agent.prep_xfer_dlist("GDSAgent", file_reg.trim())
         assert file_handle, f"GDS prep_xfer_dlist failed for job {job_id}"
+        logger.debug("submit_load 4")
 
         # Build matched ID lists: for each file, pair each tensor's FILE
         # descriptor with the corresponding VRAM descriptor.
         vram_ids = self._compute_vram_ids(gpu_spec, num_files)
         file_ids = list(range(num_files * self._num_tensors))
+        logger.debug("submit_load 5")
         # Expand vram_ids: for each offloaded block, add IDs for all tensors.
         # VRAM layout: tensor0 blocks [0..N-1], tensor1 blocks [N..2N-1], ...
         expanded_vram_ids = []
@@ -179,6 +184,7 @@ class GDSOffloadingHandler:
                     tensor_idx * self._blocks_per_tensor + block_id
                 )
         vram_ids = expanded_vram_ids
+        logger.debug("submit_load 6")
 
         xfer_handle = self._agent.make_prepped_xfer(
             NIXL_READ,
@@ -188,13 +194,16 @@ class GDSOffloadingHandler:
             file_ids,
         )
         assert xfer_handle, f"GDS make_prepped_xfer failed for job {job_id}"
+        logger.debug("submit_load 7")
 
         state = self._agent.transfer(xfer_handle)
         assert state != "ERR", f"GDS transfer failed for job {job_id}"
+        logger.debug("submit_load 8")
 
         self._transfers[job_id] = _GDSTransferEntry(
             xfer_handle, file_reg, file_handle, fds
         )
+        logger.debug("submit_load 9")
         return True
 
     def _compute_vram_ids(
