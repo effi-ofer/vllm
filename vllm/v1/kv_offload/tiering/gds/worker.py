@@ -197,8 +197,10 @@ class GDSOffloadingHandler:
         )
         assert xfer_handle, f"GDS make_prepped_xfer failed for job {job_id}"
 
+        logger.debug("   -------------------- before transfer")
         state = self._agent.transfer(xfer_handle)
         assert state != "ERR", f"GDS transfer failed for job {job_id}"
+        logger.debug("   -------------------- after transfer")
 
         self._transfers[job_id] = _GDSTransferEntry(
             job_id=job_id,
