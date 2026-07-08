@@ -28,7 +28,7 @@ from vllm.v1.kv_offload.base import (
 from vllm.v1.kv_offload.tiering.gds.common import GDSLoadStoreSpec
 
 if TYPE_CHECKING:
-    from nixl._api import nixl_prepped_dlist_handle, nixl_xfer_handle
+    from nixl._api import nixl_xfer_handle
 
     from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
 
@@ -53,7 +53,6 @@ class _GDSTransferEntry:
     # GDS phase
     xfer_handle: "nixl_xfer_handle | None" = None
     file_reg: object = None
-    file_handle: "nixl_prepped_dlist_handle | None" = None
     fds: list[int] = field(default_factory=list)
     slot_indices: list[int] = field(default_factory=list)
     # Block IDs for scatter (one per file, at offloaded-block granularity)
@@ -127,16 +126,7 @@ class GDSOffloadingHandler:
         ]
         self._vram_reg = self._agent.register_memory(vram_data, "VRAM")
 
-        # Build one VRAM descriptor per bounce buffer slot
-        slot_descs: list[tuple[int, int, int]] = []
-        for slot_idx in range(self._num_slots):
-            addr = self._bounce_buffer.data_ptr() + slot_idx * self._block_size_bytes
-            slot_descs.append((addr, self._block_size_bytes, device_id))
-
-        descs = self._agent.get_xfer_descs(slot_descs, "VRAM")
-        self._vram_handle: nixl_prepped_dlist_handle = self._agent.prep_xfer_dlist(
-            "NIXL_INIT_AGENT", descs
-        )
+        self._device_id = device_id
 
         # CUDA stream for scatter operations
         self._scatter_stream = torch.cuda.Stream(device=self._device)
@@ -181,21 +171,19 @@ class GDSOffloadingHandler:
             f"GDS register_memory(FILE) failed for job {job_id}"
         )
 
-        file_handle = self._agent.prep_xfer_dlist("GDSAgent", file_reg.trim())
-        assert file_handle, f"GDS prep_xfer_dlist failed for job {job_id}"
+        # Build VRAM descriptors for just the slots being used
+        vram_descs_data: list[tuple[int, int, int]] = []
+        for slot in slots:
+            addr = self._bounce_buffer.data_ptr() + slot * self._block_size_bytes
+            vram_descs_data.append((addr, self._block_size_bytes, self._device_id))
+        vram_descs = self._agent.get_xfer_descs(vram_descs_data, "VRAM")
 
-        # Pair each file with its bounce buffer slot
-        file_ids = list(range(num_files))
-        vram_ids = slots
-
-        xfer_handle = self._agent.make_prepped_xfer(
-            NIXL_READ,
-            self._vram_handle,
-            vram_ids,
-            file_handle,
-            file_ids,
+        # Use initialize_xfer (matches descriptors 1:1)
+        file_xfer_descs = file_reg.trim()
+        xfer_handle = self._agent.initialize_xfer(
+            NIXL_READ, vram_descs, file_xfer_descs, "GDSAgent"
         )
-        assert xfer_handle, f"GDS make_prepped_xfer failed for job {job_id}"
+        assert xfer_handle, f"GDS initialize_xfer failed for job {job_id}"
 
         logger.debug("   -------------------- before transfer")
         state = self._agent.transfer(xfer_handle)
@@ -207,7 +195,6 @@ class GDSOffloadingHandler:
             phase=_TransferPhase.GDS_IN_PROGRESS,
             xfer_handle=xfer_handle,
             file_reg=file_reg,
-            file_handle=file_handle,
             fds=fds,
             slot_indices=slots,
             offloaded_block_ids=offloaded_block_ids,
@@ -299,13 +286,11 @@ class GDSOffloadingHandler:
 
         # GDS read complete — clean up NIXL resources
         self._agent.release_xfer_handle(entry.xfer_handle)
-        self._agent.release_dlist_handle(entry.file_handle)
         self._agent.deregister_memory(entry.file_reg)
         for fd in entry.fds:
             os.close(fd)
         entry.xfer_handle = None
         entry.file_reg = None
-        entry.file_handle = None
         entry.fds = []
 
         # Start scatter phase
@@ -340,9 +325,6 @@ class GDSOffloadingHandler:
             if entry.xfer_handle is not None:
                 with contextlib.suppress(Exception):
                     self._agent.release_xfer_handle(entry.xfer_handle)
-            if entry.file_handle is not None:
-                with contextlib.suppress(Exception):
-                    self._agent.release_dlist_handle(entry.file_handle)
             if entry.file_reg is not None:
                 with contextlib.suppress(Exception):
                     self._agent.deregister_memory(entry.file_reg)
@@ -351,8 +333,6 @@ class GDSOffloadingHandler:
                     os.close(fd)
         self._transfers.clear()
 
-        with contextlib.suppress(Exception):
-            self._agent.release_dlist_handle(self._vram_handle)
         with contextlib.suppress(Exception):
             self._agent.deregister_memory(self._vram_reg)
 
