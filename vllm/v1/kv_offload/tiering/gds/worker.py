@@ -163,7 +163,7 @@ class GDSOffloadingHandler:
         slots = [self._free_slots.pop() for _ in range(num_files)]
 
         # Open files and register with NIXL
-        fds = [os.open(path, os.O_RDONLY) for path in gds_spec.file_paths]
+        fds = [os.open(path, os.O_RDONLY | os.O_DIRECT) for path in gds_spec.file_paths]
 
         file_descs = [(0, gds_spec.block_size_bytes, fd, "") for fd in fds]
         file_reg = self._agent.register_memory(file_descs, "FILE")
