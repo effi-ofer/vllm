@@ -180,8 +180,26 @@ class GDSOffloadingHandler:
 
         # Use initialize_xfer (matches descriptors 1:1)
         file_xfer_descs = file_reg.trim()
+
+        logger.debug(
+            "GDS submit_load: slots=%s, vram_descs_data=%s, "
+            "file_descs=%s, num_vram=%d, num_file=%d",
+            slots[:5],
+            vram_descs_data[:3],
+            file_descs[:3],
+            len(vram_descs_data),
+            len(file_descs),
+        )
+
         xfer_handle = self._agent.initialize_xfer(
             NIXL_READ, vram_descs, file_xfer_descs, "GDSAgent"
+        )
+
+        logger.debug(
+            "GDS submit_load: xfer_handle=%s, vram_descs=%s, file_xfer_descs=%s",
+            xfer_handle,
+            vram_descs,
+            file_xfer_descs,
         )
         assert xfer_handle, f"GDS initialize_xfer failed for job {job_id}"
 
