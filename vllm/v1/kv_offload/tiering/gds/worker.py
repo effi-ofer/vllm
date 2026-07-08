@@ -112,7 +112,10 @@ class GDSOffloadingHandler:
         self._free_slots: list[int] = list(range(self._num_slots))
 
         # NIXL setup — register only the bounce buffer
-        agent_config = nixl_agent_config(backends=["GDS"])
+        agent_config = nixl_agent_config(
+            backends=["GDS"],
+            custom_params={"batch_limit": "128", "batch_pool_size": "64"},
+        )
         self._agent = NixlWrapper("GDSAgent", agent_config)
 
         device_id = self._device.index
