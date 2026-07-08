@@ -91,7 +91,11 @@ class GDSOffloadingHandler:
             device_id = t.device.index
             vram_data.append((base_addr, total_bytes, device_id, ""))
 
+        logger.debug("about to register_memory")
+
         self._vram_reg = self._agent.register_memory(vram_data, "VRAM")
+
+        logger.debug("after register_memory")
 
         # Build per-block VRAM descriptors for transfer.
         # Each offloaded block on disk contains data for ALL tensors
@@ -114,6 +118,8 @@ class GDSOffloadingHandler:
                 addr = t.data_ptr() + offset
                 blocks_data.append((addr, offloaded_page_size, device_id))
 
+        logger.debug("about to get_xfer_descs")
+
         descs = self._agent.get_xfer_descs(blocks_data, "VRAM")
         self._vram_prepped_handle: nixl_prepped_dlist_handle = (
             self._agent.prep_xfer_dlist("NIXL_INIT_AGENT", descs)
@@ -121,6 +127,8 @@ class GDSOffloadingHandler:
         self._blocks_per_tensor = (
             self._gpu_tensors[0].shape[0] // self._block_size_factor
         )
+
+        logger.debug("done with register_vram")
 
     # TODO: handle GDS failures rather than assert
     def submit_load(
