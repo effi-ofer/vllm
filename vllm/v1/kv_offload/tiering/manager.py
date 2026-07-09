@@ -145,6 +145,7 @@ class TieringOffloadingManager(OffloadingManager):
         secondary_tiers: list[SecondaryTierManager] | None = None,
         enable_events: bool = False,
         gds_available: bool = False,
+        num_gds_slots: int = 0,
     ):
         """
         Initialize the TieringOffloadingManager.
@@ -157,6 +158,7 @@ class TieringOffloadingManager(OffloadingManager):
             gds_available: Whether GDS (GPU Direct Storage) is available.
                 When True, blocks found in a GDS-capable secondary tier
                 bypass CPU primary and transfer directly FS->GPU.
+            num_gds_slots: Number of GDS bounce buffer slots available.
         """
         self.primary_tier: CPUPrimaryTierOffloadingManager = primary_tier
         self.secondary_tiers = secondary_tiers or []
@@ -192,6 +194,9 @@ class TieringOffloadingManager(OffloadingManager):
         self._gds_available: bool = gds_available
         self._gds_ready_keys: dict[str, set[OffloadKey]] = {}
         self._gds_tier: Any = None
+        # GDS bounce buffer slot management (scheduler-side)
+        self._gds_free_slots: list[int] = list(range(num_gds_slots))
+        self._gds_reserved_slots: dict[str, list[int]] = {}
         if gds_available:
             for tier in self.secondary_tiers:
                 if getattr(tier, "supports_gds", False):
@@ -374,15 +379,28 @@ class TieringOffloadingManager(OffloadingManager):
 
         self._pending_load_submissions.clear()
 
-    def _build_gds_spec(self, keys: Collection[OffloadKey]) -> "GDSLoadStoreSpec":
-        """Build a GDSLoadStoreSpec with file paths for the given keys."""
+    def _build_gds_spec(
+        self, keys: Collection[OffloadKey], req_id: str
+    ) -> "GDSLoadStoreSpec | None":
+        """Build a GDSLoadStoreSpec with file paths and reserved slots.
+
+        Returns None if not enough bounce buffer slots are available.
+        """
         from vllm.v1.kv_offload.tiering.gds.common import GDSLoadStoreSpec
 
         assert self._gds_tier is not None
+        num_needed = len(list(keys))
+        if len(self._gds_free_slots) < num_needed:
+            return None
+
+        slots = [self._gds_free_slots.pop() for _ in range(num_needed)]
+        self._gds_reserved_slots[req_id] = slots
+
         file_paths = [self._gds_tier.get_file_path(key) for key in keys]
         return GDSLoadStoreSpec(
             file_paths=file_paths,
             block_size_bytes=self._gds_tier.block_size,
+            slot_indices=slots,
         )
 
     @override
@@ -414,7 +432,15 @@ class TieringOffloadingManager(OffloadingManager):
             cpu_keys = [k for k in keys if k not in gds_set]
 
             if gds_keys and not cpu_keys:
-                return self._build_gds_spec(gds_keys)
+                spec = self._build_gds_spec(gds_keys, req_context.req_id)
+                if spec is not None:
+                    return spec
+                # Not enough GDS slots — fall through to CPU path
+                logger.debug(
+                    "GDS slots exhausted for req %s (%d keys), falling back to CPU",
+                    req_context.req_id,
+                    len(gds_keys),
+                )
             elif cpu_keys and not gds_keys:
                 return self.primary_tier.prepare_load(cpu_keys, req_context)
             # Mixed: fall back to CPU path for all (rare in practice)
@@ -451,6 +477,12 @@ class TieringOffloadingManager(OffloadingManager):
         for tier in self.secondary_tiers:
             tier.touch(keys, req_context)
 
+    def _release_gds_slots(self, req_id: str) -> None:
+        """Return reserved GDS bounce buffer slots to the free pool."""
+        slots = self._gds_reserved_slots.pop(req_id, None)
+        if slots:
+            self._gds_free_slots.extend(slots)
+
     @override
     def complete_load(self, keys: Collection[OffloadKey], req_context: ReqContext):
         """
@@ -463,6 +495,7 @@ class TieringOffloadingManager(OffloadingManager):
             keys: Blocks that finished loading.
             req_context: Per-request context.
         """
+        self._release_gds_slots(req_context.req_id)
         gds_set = self._gds_ready_keys.pop(req_context.req_id, None)
         if gds_set:
             cpu_keys = [k for k in keys if k not in gds_set]
@@ -648,6 +681,7 @@ class TieringOffloadingManager(OffloadingManager):
 
     @override
     def on_request_finished(self, req_context: ReqContext) -> None:
+        self._release_gds_slots(req_context.req_id)
         self._gds_ready_keys.pop(req_context.req_id, None)
         self.primary_tier.on_request_finished(req_context)
         state = self._req_state[req_context.req_id]

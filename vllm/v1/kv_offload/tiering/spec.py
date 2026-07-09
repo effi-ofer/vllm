@@ -169,11 +169,19 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
             # Create TieringOffloadingManager. GPU↔CPU transfers use the inherited
             # get_worker(). Secondary tier transfers are handled by the
             # secondary tier managers and need no additional workers here.
+            num_gds_slots = 0
+            if self._gds_enabled:
+                from vllm.v1.kv_offload.tiering.gds.worker import (
+                    _DEFAULT_BOUNCE_SLOTS,
+                )
+
+                num_gds_slots = _DEFAULT_BOUNCE_SLOTS
             tiering_manager = TieringOffloadingManager(
                 primary_tier=primary_tier,
                 secondary_tiers=secondary_tiers,
                 enable_events=self.kv_events_config.enable_kv_cache_events,
                 gds_available=self._gds_enabled,
+                num_gds_slots=num_gds_slots,
             )
             if int(self.extra_config.get("store_threshold", 0)) >= 2:
                 raise ValueError(

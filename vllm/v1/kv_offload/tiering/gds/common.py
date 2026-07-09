@@ -20,6 +20,7 @@ class GDSLoadStoreSpec(LoadStoreSpec):
 
     file_paths: list[str]
     block_size_bytes: int
+    slot_indices: list[int]
 
     @staticmethod
     @override

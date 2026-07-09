@@ -38,7 +38,7 @@ NIXL_READ = "READ"
 NIXL_PROC = "PROC"
 NIXL_DONE = "DONE"
 
-_DEFAULT_BOUNCE_SLOTS = 64
+_DEFAULT_BOUNCE_SLOTS = 320
 
 
 class _TransferPhase(Enum):
@@ -109,7 +109,6 @@ class GDSOffloadingHandler:
             dtype=torch.int8,
             device=self._device,
         )
-        self._free_slots: list[int] = list(range(self._num_slots))
 
         # NIXL setup — register only the bounce buffer
         agent_config = nixl_agent_config(backends=[])
@@ -156,12 +155,8 @@ class GDSOffloadingHandler:
         # Compute destination offloaded block IDs
         offloaded_block_ids = self._compute_offloaded_block_ids(gpu_spec, num_files)
 
-        # Acquire bounce buffer slots
-        assert len(self._free_slots) >= num_files, (
-            f"GDS job={job_id} needs {num_files} slots but only "
-            f"{len(self._free_slots)} free"
-        )
-        slots = [self._free_slots.pop() for _ in range(num_files)]
+        # Use pre-reserved slots from the scheduler
+        slots = gds_spec.slot_indices
 
         # Open files and register with NIXL
         fds = [os.open(path, os.O_RDONLY | os.O_DIRECT) for path in gds_spec.file_paths]
@@ -314,8 +309,7 @@ class GDSOffloadingHandler:
         if not entry.scatter_event.query():
             return
 
-        # Scatter complete — release slots and report done
-        self._free_slots.extend(entry.slot_indices)
+        # Scatter complete — report done (scheduler releases slots)
         del self._transfers[job_id]
         self._pending_results.append(TransferResult(job_id=job_id, success=True))
 
