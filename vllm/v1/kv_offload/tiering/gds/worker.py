@@ -140,69 +140,53 @@ class GDSOffloadingHandler:
         gds_spec: GDSLoadStoreSpec,
         gpu_spec: GPULoadStoreSpec,
     ) -> bool:
-        """Initiate FS->GPU transfer via GDS bounce buffer."""
+        """Initiate FS->GPU transfer via GDS bounce buffer (single-file debug)."""
         num_files = len(gds_spec.file_paths)
         logger.debug(
-            "GDS submit_load job=%d, %d files, %d bytes each",
+            "GDS submit_load job=%d, %d files (using 1), %d bytes each",
             job_id,
             num_files,
             gds_spec.block_size_bytes,
         )
 
-        # Compute destination offloaded block IDs
-        offloaded_block_ids = self._compute_offloaded_block_ids(gpu_spec, num_files)
+        # DEBUG: only transfer the first file/block to isolate hangs
+        offloaded_block_ids = self._compute_offloaded_block_ids(gpu_spec, 1)
 
-        # Acquire bounce buffer slots
-        if len(self._free_slots) < num_files:
-            logger.warning(
-                "GDS job=%d needs %d slots but only %d free, deferring",
-                job_id,
-                num_files,
-                len(self._free_slots),
-            )
-            self._pending_results.append(TransferResult(job_id=job_id, success=False))
-            return False
+        # Acquire a single bounce buffer slot
+        assert len(self._free_slots) >= 1, (
+            f"GDS job={job_id} needs 1 slot but none free"
+        )
+        slots = [self._free_slots.pop()]
 
-        slots = [self._free_slots.pop() for _ in range(num_files)]
+        # Open only the first file
+        fd = os.open(gds_spec.file_paths[0], os.O_RDONLY | os.O_DIRECT)
+        fds = [fd]
 
-        # Open files and register with NIXL
-        fds = [os.open(path, os.O_RDONLY | os.O_DIRECT) for path in gds_spec.file_paths]
-
-        file_descs = [(0, gds_spec.block_size_bytes, fd, "") for fd in fds]
+        file_descs = [(0, gds_spec.block_size_bytes, fd, "")]
         file_reg = self._agent.register_memory(file_descs, "FILE")
         assert file_reg is not None, (
             f"GDS register_memory(FILE) failed for job {job_id}"
         )
 
-        # Build VRAM descriptors for just the slots being used
-        vram_descs_data: list[tuple[int, int, int]] = []
-        for slot in slots:
-            addr = self._bounce_buffer.data_ptr() + slot * self._block_size_bytes
-            vram_descs_data.append((addr, self._block_size_bytes, self._device_id))
+        # Single VRAM descriptor for the one slot
+        slot = slots[0]
+        addr = self._bounce_buffer.data_ptr() + slot * self._block_size_bytes
+        vram_descs_data = [(addr, self._block_size_bytes, self._device_id)]
         vram_descs = self._agent.get_xfer_descs(vram_descs_data, "VRAM")
 
-        # Use initialize_xfer (matches descriptors 1:1)
         file_xfer_descs = file_reg.trim()
 
         logger.debug(
-            "GDS submit_load: slots=%s, vram_descs_data=%s, "
-            "file_descs=%s, num_vram=%d, num_file=%d",
-            slots[:5],
-            vram_descs_data[:3],
-            file_descs[:3],
-            len(vram_descs_data),
-            len(file_descs),
+            "GDS submit_load (single): slot=%d, addr=0x%x, size=%d, fd=%d, file=%s",
+            slot,
+            addr,
+            self._block_size_bytes,
+            fd,
+            gds_spec.file_paths[0],
         )
 
         xfer_handle = self._agent.initialize_xfer(
             NIXL_READ, vram_descs, file_xfer_descs, "GDSAgent"
-        )
-
-        logger.debug(
-            "GDS submit_load: xfer_handle=%s, vram_descs=%s, file_xfer_descs=%s",
-            xfer_handle,
-            vram_descs,
-            file_xfer_descs,
         )
         assert xfer_handle, f"GDS initialize_xfer failed for job {job_id}"
 
