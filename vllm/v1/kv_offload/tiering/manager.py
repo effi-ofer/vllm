@@ -436,10 +436,12 @@ class TieringOffloadingManager(OffloadingManager):
                 if spec is not None:
                     return spec
                 # Not enough GDS slots — fall through to CPU path
-                logger.debug(
-                    "GDS slots exhausted for req %s (%d keys), falling back to CPU",
+                logger.info(
+                    "GDS slots exhausted for req %s (%d keys, %d free), "
+                    "falling back to CPU",
                     req_context.req_id,
                     len(gds_keys),
+                    len(self._gds_free_slots),
                 )
             elif cpu_keys and not gds_keys:
                 return self.primary_tier.prepare_load(cpu_keys, req_context)
