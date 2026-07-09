@@ -118,7 +118,7 @@ class GDSOffloadingHandler:
             "GDS",
             {
                 "max_request_size": str(self._block_size_bytes),
-                "batch_limit": "256",
+                "batch_limit": "128",
             },
         )
 
