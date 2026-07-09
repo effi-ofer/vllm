@@ -202,6 +202,14 @@ class TieringOffloadingManager(OffloadingManager):
                 if getattr(tier, "supports_gds", False):
                     self._gds_tier = tier
                     break
+            if self._gds_tier:
+                logger.info(
+                    "GDS enabled: tier=%s, num_slots=%d",
+                    self._gds_tier.tier_type,
+                    num_gds_slots,
+                )
+            else:
+                logger.warning("GDS enabled but no tier supports GDS")
 
     def _next_job_id(self) -> JobId:
         """Generate a unique job ID for async transfer tracking."""
