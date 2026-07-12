@@ -289,7 +289,6 @@ class TieringOffloadingManager(OffloadingManager):
                         and cannot accept a promotion.
         """
         self._maybe_process_finished_jobs()
-        logger.info("lookup")
 
         primary_hit = self.primary_tier.lookup(key, req_context)
         if primary_hit is LookupResult.HIT:
@@ -301,14 +300,6 @@ class TieringOffloadingManager(OffloadingManager):
         for tier in self.secondary_tiers:
             result = tier.lookup(key, req_context)
             if result is LookupResult.HIT:
-                logger.warning(
-                    "LOOKUP HIT: gds_available=%s, is_gds_tier=%s, "
-                    "gds_allowed=%s, req_id=%s",
-                    self._gds_available,
-                    tier is self._gds_tier,
-                    req_context.gds_allowed,
-                    req_context.req_id,
-                )
                 if (
                     self._gds_available
                     and tier is self._gds_tier
@@ -322,13 +313,13 @@ class TieringOffloadingManager(OffloadingManager):
                         logger.warning(
                             " .NOT ........ req_id=%s, gds_free_slots=%d",
                             req_context.req_id,
-                            self._gds_free_slots,
+                            len(self._gds_free_slots),
                         )
                     else:
                         logger.warning(
                             " .ALLOWED..... req_id=%s, gds_free_slots=%d",
                             req_context.req_id,
-                            self._gds_free_slots,
+                            len(self._gds_free_slots),
                         )
                         slot = self._gds_free_slots.pop()
                         self._gds_ready_keys.setdefault(req_context.req_id, set()).add(
