@@ -145,7 +145,7 @@ class GDSOffloadingHandler:
     ) -> bool:
         """Initiate FS->GPU transfer via GDS bounce buffer."""
         num_files = len(gds_spec.file_paths)
-        logger.debug(
+        logger.info(
             "GDS submit_load job=%d, %d files, %d bytes each",
             job_id,
             num_files,
