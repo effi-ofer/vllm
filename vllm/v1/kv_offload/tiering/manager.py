@@ -310,9 +310,14 @@ class TieringOffloadingManager(OffloadingManager):
                         and len(self._gds_free_slots) < 64
                     ):
                         req_context.gds_allowed = False
+                        logger.warning(
+                            " .NOT ........ req_id=%s, gds_free_slots=%d",
+                            req_context.req_id,
+                            self._gds_free_slots,
+                        )
                     else:
                         logger.warning(
-                            " ......... req_id=%s, gds_free_slots=%d",
+                            " .ALLOWED..... req_id=%s, gds_free_slots=%d",
                             req_context.req_id,
                             self._gds_free_slots,
                         )
