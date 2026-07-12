@@ -311,6 +311,11 @@ class TieringOffloadingManager(OffloadingManager):
                     ):
                         req_context.gds_allowed = False
                     else:
+                        logger.warning(
+                            " ......... req_id=%s, gds_free_slots=%d",
+                            req_context.req_id,
+                            self._gds_free_slots,
+                        )
                         slot = self._gds_free_slots.pop()
                         self._gds_ready_keys.setdefault(req_context.req_id, set()).add(
                             key
