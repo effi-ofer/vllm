@@ -305,6 +305,9 @@ class TieringOffloadingManager(OffloadingManager):
                 if self._gds_available and tier is self._gds_tier:
                     req_id = req_context.req_id
                     if self._gds_active_req is None or self._gds_active_req == req_id:
+                        gds_set = self._gds_ready_keys.get(req_id)
+                        if gds_set and key in gds_set:
+                            return LookupResult.HIT
                         if self._gds_active_req is None:
                             self._gds_active_req = req_id
                         slot = self._gds_free_slots.pop()
