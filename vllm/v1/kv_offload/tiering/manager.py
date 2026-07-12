@@ -300,17 +300,20 @@ class TieringOffloadingManager(OffloadingManager):
         for tier in self.secondary_tiers:
             result = tier.lookup(key, req_context)
             if result is LookupResult.HIT:
-                if (
-                    self._gds_available
-                    and tier is self._gds_tier
-                    and self._gds_free_slots
-                ):
-                    slot = self._gds_free_slots.pop()
-                    self._gds_ready_keys.setdefault(req_context.req_id, set()).add(key)
-                    self._gds_reserved_slots.setdefault(req_context.req_id, []).append(
-                        slot
-                    )
-                    return LookupResult.HIT
+                if self._gds_available and tier is self._gds_tier:
+                    if self._gds_free_slots:
+                        slot = self._gds_free_slots.pop()
+                        self._gds_ready_keys.setdefault(req_context.req_id, set()).add(
+                            key
+                        )
+                        self._gds_reserved_slots.setdefault(
+                            req_context.req_id, []
+                        ).append(slot)
+                        return LookupResult.HIT
+                    # No slots — release any already-claimed slots for
+                    # this request to avoid mixed GDS/CPU state.
+                    self._release_gds_slots(req_context.req_id)
+                    self._gds_ready_keys.pop(req_context.req_id, None)
                 if not self._initiate_promotion(tier, key, req_context):
                     return LookupResult.MISS
                 return LookupResult.RETRY
