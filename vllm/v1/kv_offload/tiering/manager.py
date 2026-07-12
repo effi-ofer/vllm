@@ -311,9 +311,13 @@ class TieringOffloadingManager(OffloadingManager):
                     ):
                         req_context.gds_allowed = False
                     else:
+                        slot = self._gds_free_slots.pop()
                         self._gds_ready_keys.setdefault(req_context.req_id, set()).add(
                             key
                         )
+                        self._gds_reserved_slots.setdefault(
+                            req_context.req_id, []
+                        ).append(slot)
                         return LookupResult.HIT
                 # GDS not allowed — fall through to CPU promotion
                 if not self._initiate_promotion(tier, key, req_context):
@@ -402,13 +406,11 @@ class TieringOffloadingManager(OffloadingManager):
     def _build_gds_spec(
         self, keys: Collection[OffloadKey], req_id: str
     ) -> "GDSLoadStoreSpec":
-        """Build a GDSLoadStoreSpec with file paths and reserved slots."""
+        """Build a GDSLoadStoreSpec with file paths and pre-reserved slots."""
         from vllm.v1.kv_offload.tiering.gds.common import GDSLoadStoreSpec
 
         assert self._gds_tier is not None
-        num_keys = len(list(keys))
-        slots = [self._gds_free_slots.pop() for _ in range(num_keys)]
-        self._gds_reserved_slots[req_id] = slots
+        slots = self._gds_reserved_slots[req_id]
 
         file_paths = [self._gds_tier.get_file_path(key) for key in keys]
         return GDSLoadStoreSpec(
