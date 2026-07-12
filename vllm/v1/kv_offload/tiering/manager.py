@@ -402,11 +402,13 @@ class TieringOffloadingManager(OffloadingManager):
     def _build_gds_spec(
         self, keys: Collection[OffloadKey], req_id: str
     ) -> "GDSLoadStoreSpec":
-        """Build a GDSLoadStoreSpec with file paths and pre-reserved slots."""
+        """Build a GDSLoadStoreSpec with file paths and reserved slots."""
         from vllm.v1.kv_offload.tiering.gds.common import GDSLoadStoreSpec
 
         assert self._gds_tier is not None
-        slots = self._gds_reserved_slots[req_id]
+        num_keys = len(list(keys))
+        slots = [self._gds_free_slots.pop() for _ in range(num_keys)]
+        self._gds_reserved_slots[req_id] = slots
 
         file_paths = [self._gds_tier.get_file_path(key) for key in keys]
         return GDSLoadStoreSpec(
