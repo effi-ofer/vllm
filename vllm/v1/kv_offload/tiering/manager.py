@@ -301,9 +301,16 @@ class TieringOffloadingManager(OffloadingManager):
             result = tier.lookup(key, req_context)
             if result is LookupResult.HIT:
                 if self._gds_available and tier is self._gds_tier:
-                    # GDS path: no CPU allocation, transfer happens on worker
-                    self._gds_ready_keys.setdefault(req_context.req_id, set()).add(key)
-                    return LookupResult.HIT
+                    # GDS path: check if bounce buffer slots available
+                    gds_claimed = len(
+                        self._gds_ready_keys.get(req_context.req_id, set())
+                    )
+                    if gds_claimed < len(self._gds_free_slots):
+                        self._gds_ready_keys.setdefault(req_context.req_id, set()).add(
+                            key
+                        )
+                        return LookupResult.HIT
+                    # No slots — fall through to CPU promotion
                 if not self._initiate_promotion(tier, key, req_context):
                     return LookupResult.MISS
                 return LookupResult.RETRY
@@ -441,16 +448,11 @@ class TieringOffloadingManager(OffloadingManager):
 
             if gds_keys and not cpu_keys:
                 spec = self._build_gds_spec(gds_keys, req_context.req_id)
-                if spec is not None:
-                    return spec
-                # Not enough GDS slots — fall through to CPU path
-                logger.info(
-                    "GDS slots exhausted for req %s (%d keys, %d free), "
-                    "falling back to CPU",
-                    req_context.req_id,
-                    len(gds_keys),
-                    len(self._gds_free_slots),
+                assert spec is not None, (
+                    "GDS slots were reserved in lookup() but unavailable "
+                    "in prepare_load()"
                 )
+                return spec
             elif cpu_keys and not gds_keys:
                 return self.primary_tier.prepare_load(cpu_keys, req_context)
             # Mixed: fall back to CPU path for all (rare in practice)
