@@ -300,17 +300,17 @@ class TieringOffloadingManager(OffloadingManager):
         for tier in self.secondary_tiers:
             result = tier.lookup(key, req_context)
             if result is LookupResult.HIT:
-                if self._gds_available and tier is self._gds_tier:
-                    # GDS path: check if bounce buffer slots available
-                    gds_claimed = len(
-                        self._gds_ready_keys.get(req_context.req_id, set())
+                if (
+                    self._gds_available
+                    and tier is self._gds_tier
+                    and self._gds_free_slots
+                ):
+                    slot = self._gds_free_slots.pop()
+                    self._gds_ready_keys.setdefault(req_context.req_id, set()).add(key)
+                    self._gds_reserved_slots.setdefault(req_context.req_id, []).append(
+                        slot
                     )
-                    if gds_claimed < len(self._gds_free_slots):
-                        self._gds_ready_keys.setdefault(req_context.req_id, set()).add(
-                            key
-                        )
-                        return LookupResult.HIT
-                    # No slots — fall through to CPU promotion
+                    return LookupResult.HIT
                 if not self._initiate_promotion(tier, key, req_context):
                     return LookupResult.MISS
                 return LookupResult.RETRY
@@ -396,20 +396,12 @@ class TieringOffloadingManager(OffloadingManager):
 
     def _build_gds_spec(
         self, keys: Collection[OffloadKey], req_id: str
-    ) -> "GDSLoadStoreSpec | None":
-        """Build a GDSLoadStoreSpec with file paths and reserved slots.
-
-        Returns None if not enough bounce buffer slots are available.
-        """
+    ) -> "GDSLoadStoreSpec":
+        """Build a GDSLoadStoreSpec with file paths and pre-reserved slots."""
         from vllm.v1.kv_offload.tiering.gds.common import GDSLoadStoreSpec
 
         assert self._gds_tier is not None
-        num_needed = len(list(keys))
-        if len(self._gds_free_slots) < num_needed:
-            return None
-
-        slots = [self._gds_free_slots.pop() for _ in range(num_needed)]
-        self._gds_reserved_slots[req_id] = slots
+        slots = self._gds_reserved_slots[req_id]
 
         file_paths = [self._gds_tier.get_file_path(key) for key in keys]
         return GDSLoadStoreSpec(
@@ -447,12 +439,7 @@ class TieringOffloadingManager(OffloadingManager):
             cpu_keys = [k for k in keys if k not in gds_set]
 
             if gds_keys and not cpu_keys:
-                spec = self._build_gds_spec(gds_keys, req_context.req_id)
-                assert spec is not None, (
-                    "GDS slots were reserved in lookup() but unavailable "
-                    "in prepare_load()"
-                )
-                return spec
+                return self._build_gds_spec(gds_keys, req_context.req_id)
             elif cpu_keys and not gds_keys:
                 return self.primary_tier.prepare_load(cpu_keys, req_context)
             # Mixed: fall back to CPU path for all (rare in practice)
