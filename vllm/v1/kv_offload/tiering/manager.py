@@ -194,9 +194,11 @@ class TieringOffloadingManager(OffloadingManager):
         self._gds_available: bool = gds_available
         self._gds_ready_keys: dict[str, set[OffloadKey]] = {}
         self._gds_tier: Any = None
-        # GDS bounce buffer slot management (scheduler-side)
+        # GDS bounce buffer slot management (scheduler-side).
+        # Only one request at a time may use GDS (serialized transfers).
         self._gds_free_slots: list[int] = list(range(num_gds_slots))
         self._gds_reserved_slots: dict[str, list[int]] = {}
+        self._gds_active_req: str | None = None
         if gds_available:
             for tier in self.secondary_tiers:
                 if getattr(tier, "supports_gds", False):
@@ -300,34 +302,14 @@ class TieringOffloadingManager(OffloadingManager):
         for tier in self.secondary_tiers:
             result = tier.lookup(key, req_context)
             if result is LookupResult.HIT:
-                if (
-                    self._gds_available
-                    and tier is self._gds_tier
-                    and req_context.gds_allowed
-                ):
-                    if (
-                        req_context.req_id not in self._gds_ready_keys
-                        and len(self._gds_free_slots) < 64
-                    ):
-                        req_context.gds_allowed = False
-                        logger.warning(
-                            " .NOT ........ req_id=%s, gds_free_slots=%d",
-                            req_context.req_id,
-                            len(self._gds_free_slots),
-                        )
-                    else:
-                        logger.warning(
-                            " .ALLOWED..... req_id=%s, gds_free_slots=%d",
-                            req_context.req_id,
-                            len(self._gds_free_slots),
-                        )
+                if self._gds_available and tier is self._gds_tier:
+                    req_id = req_context.req_id
+                    if self._gds_active_req is None or self._gds_active_req == req_id:
+                        if self._gds_active_req is None:
+                            self._gds_active_req = req_id
                         slot = self._gds_free_slots.pop()
-                        self._gds_ready_keys.setdefault(req_context.req_id, set()).add(
-                            key
-                        )
-                        self._gds_reserved_slots.setdefault(
-                            req_context.req_id, []
-                        ).append(slot)
+                        self._gds_ready_keys.setdefault(req_id, set()).add(key)
+                        self._gds_reserved_slots.setdefault(req_id, []).append(slot)
                         return LookupResult.HIT
                 # GDS not allowed — fall through to CPU promotion
                 if not self._initiate_promotion(tier, key, req_context):
@@ -500,6 +482,8 @@ class TieringOffloadingManager(OffloadingManager):
         slots = self._gds_reserved_slots.pop(req_id, None)
         if slots:
             self._gds_free_slots.extend(slots)
+        if self._gds_active_req == req_id:
+            self._gds_active_req = None
 
     @override
     def complete_load(self, keys: Collection[OffloadKey], req_context: ReqContext):

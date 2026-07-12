@@ -51,7 +51,6 @@ def get_offload_group_idx(key: OffloadKey) -> int:
 class ReqContext:
     req_id: str
     kv_transfer_params: dict[str, Any] | None = None
-    gds_allowed: bool = True
 
 
 class LookupResult(Enum):
