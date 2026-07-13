@@ -145,7 +145,7 @@ class GDSOffloadingHandler:
     ) -> bool:
         """Initiate FS->GPU transfer via GDS bounce buffer."""
         num_files = len(gds_spec.file_paths)
-        logger.info(
+        logger.debug(
             "GDS submit_load job=%d, %d files, %d bytes each",
             job_id,
             num_files,
@@ -176,25 +176,13 @@ class GDSOffloadingHandler:
 
         file_xfer_descs = file_reg.trim()
 
-        logger.debug(
-            "GDS submit_load: slots=%s, vram_descs_data=%s, "
-            "file_descs=%s, num_vram=%d, num_file=%d",
-            slots[:5],
-            vram_descs_data[:3],
-            file_descs[:3],
-            len(vram_descs_data),
-            len(file_descs),
-        )
-
         xfer_handle = self._agent.initialize_xfer(
             NIXL_READ, vram_descs, file_xfer_descs, "GDSAgent"
         )
         assert xfer_handle, f"GDS initialize_xfer failed for job {job_id}"
 
-        logger.debug("   -------------------- before transfer")
         state = self._agent.transfer(xfer_handle)
         assert state != "ERR", f"GDS transfer failed for job {job_id}"
-        logger.debug("   -------------------- after transfer")
 
         self._transfers[job_id] = _GDSTransferEntry(
             job_id=job_id,

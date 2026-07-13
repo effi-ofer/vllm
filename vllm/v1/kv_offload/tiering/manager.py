@@ -195,10 +195,12 @@ class TieringOffloadingManager(OffloadingManager):
         self._gds_ready_keys: dict[str, set[OffloadKey]] = {}
         self._gds_tier: Any = None
         # GDS bounce buffer slot management (scheduler-side).
-        # Only one request at a time may use GDS (serialized transfers).
+        # Each request that uses GDS reserves a fixed block of slots upfront.
+        # If not enough slots are available, the request falls back to CPU.
+        self._gds_slots_per_request: int = 64
         self._gds_free_slots: list[int] = list(range(num_gds_slots))
         self._gds_reserved_slots: dict[str, list[int]] = {}
-        self._gds_active_req: str | None = None
+        self._gds_slot_cursor: dict[str, int] = {}
         if gds_available:
             for tier in self.secondary_tiers:
                 if getattr(tier, "supports_gds", False):
@@ -294,13 +296,8 @@ class TieringOffloadingManager(OffloadingManager):
 
         primary_hit = self.primary_tier.lookup(key, req_context)
         if primary_hit is LookupResult.HIT:
-            if self._gds_active_req != req_context.req_id:
-                return LookupResult.HIT
-            logger.debug(
-                "GDS-active req %s: skipping primary HIT, using GDS",
-                req_context.req_id,
-            )
-        elif primary_hit is LookupResult.HIT_PENDING:
+            return LookupResult.HIT
+        if primary_hit is LookupResult.HIT_PENDING:
             return LookupResult.HIT_PENDING
 
         any_retry = False
@@ -309,17 +306,13 @@ class TieringOffloadingManager(OffloadingManager):
             if result is LookupResult.HIT:
                 if tier is self._gds_tier:
                     req_id = req_context.req_id
-                    if self._gds_active_req is None:
-                        self._gds_active_req = req_id
-                    if self._gds_active_req == req_id:
-                        gds_set = self._gds_ready_keys.get(req_id)
-                        if gds_set and key in gds_set:
-                            return LookupResult.HIT
-                        slot = self._gds_free_slots.pop()
-                        self._gds_ready_keys.setdefault(req_id, set()).add(key)
-                        self._gds_reserved_slots.setdefault(req_id, []).append(slot)
+                    gds_set = self._gds_ready_keys.get(req_id)
+                    if gds_set and key in gds_set:
                         return LookupResult.HIT
-                # GDS not allowed — fall through to CPU promotion
+                    if self._try_reserve_gds_slot(req_id):
+                        self._gds_ready_keys.setdefault(req_id, set()).add(key)
+                        return LookupResult.HIT
+                # GDS not available — fall through to CPU promotion
                 if not self._initiate_promotion(tier, key, req_context):
                     return LookupResult.MISS
                 return LookupResult.RETRY
@@ -406,11 +399,12 @@ class TieringOffloadingManager(OffloadingManager):
     def _build_gds_spec(
         self, keys: Collection[OffloadKey], req_id: str
     ) -> "GDSLoadStoreSpec":
-        """Build a GDSLoadStoreSpec with file paths and pre-reserved slots."""
+        """Build a GDSLoadStoreSpec with file paths and used slots."""
         from vllm.v1.kv_offload.tiering.gds.common import GDSLoadStoreSpec
 
         assert self._gds_tier is not None
-        slots = self._gds_reserved_slots[req_id]
+        cursor = self._gds_slot_cursor[req_id]
+        slots = self._gds_reserved_slots[req_id][:cursor]
 
         file_paths = [self._gds_tier.get_file_path(key) for key in keys]
         return GDSLoadStoreSpec(
@@ -451,10 +445,20 @@ class TieringOffloadingManager(OffloadingManager):
                 return self._build_gds_spec(gds_keys, req_context.req_id)
             elif cpu_keys and not gds_keys:
                 return self.primary_tier.prepare_load(cpu_keys, req_context)
-            # Mixed state should not occur: the GDS-active request's
-            # primary-hit keys are redirected to GDS in lookup().
-            logger.error("Unexpected mixed GDS/CPU keys")
-            # TODO: handle properly
+            # Mixed: some keys hit primary, some went through GDS.
+            # Add cpu_keys to GDS path (their files exist on disk since
+            # blocks are cascaded to all tiers). Consume from reserved block.
+            req_id = req_context.req_id
+            for k in cpu_keys:
+                if not self._try_reserve_gds_slot(req_id):
+                    break
+                gds_set.add(k)
+            # Re-split after attempting to pull cpu_keys into GDS
+            gds_keys = [k for k in keys if k in gds_set]
+            cpu_keys = [k for k in keys if k not in gds_set]
+            if cpu_keys:
+                self.primary_tier.prepare_load(cpu_keys, req_context)
+            return self._build_gds_spec(gds_keys, req_id)
 
         return self.primary_tier.prepare_load(keys, req_context)
 
@@ -480,13 +484,35 @@ class TieringOffloadingManager(OffloadingManager):
         for tier in self.secondary_tiers:
             tier.touch(keys, req_context)
 
+    def _try_reserve_gds_slot(self, req_id: str) -> bool:
+        """Try to assign one GDS slot to a request.
+
+        On first call for a request, reserves a fixed block of slots upfront.
+        Subsequent calls consume from the reserved block. Returns False if
+        the block couldn't be reserved or is exhausted.
+        """
+        if req_id not in self._gds_reserved_slots:
+            # First GDS key for this request — reserve a fixed block
+            if len(self._gds_free_slots) < self._gds_slots_per_request:
+                return False
+            slots = [
+                self._gds_free_slots.pop() for _ in range(self._gds_slots_per_request)
+            ]
+            self._gds_reserved_slots[req_id] = slots
+            self._gds_slot_cursor[req_id] = 0
+
+        cursor = self._gds_slot_cursor[req_id]
+        if cursor >= len(self._gds_reserved_slots[req_id]):
+            return False
+        self._gds_slot_cursor[req_id] = cursor + 1
+        return True
+
     def _release_gds_slots(self, req_id: str) -> None:
         """Return reserved GDS bounce buffer slots to the free pool."""
         slots = self._gds_reserved_slots.pop(req_id, None)
         if slots:
             self._gds_free_slots.extend(slots)
-        if self._gds_active_req == req_id:
-            self._gds_active_req = None
+        self._gds_slot_cursor.pop(req_id, None)
 
     @override
     def complete_load(self, keys: Collection[OffloadKey], req_context: ReqContext):
@@ -787,6 +813,11 @@ class TieringOffloadingManager(OffloadingManager):
             del self._req_state[req_id]
         self._processed_jobs_this_step = False
         self._gds_ready_keys.clear()
+        # Return any in-flight GDS slots to the free pool
+        for slots in self._gds_reserved_slots.values():
+            self._gds_free_slots.extend(slots)
+        self._gds_reserved_slots.clear()
+        self._gds_slot_cursor.clear()
 
     @override
     def get_stats(self) -> OffloadingConnectorStats | None:
