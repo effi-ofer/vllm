@@ -294,22 +294,27 @@ class TieringOffloadingManager(OffloadingManager):
 
         primary_hit = self.primary_tier.lookup(key, req_context)
         if primary_hit is LookupResult.HIT:
-            return LookupResult.HIT
-        if primary_hit is LookupResult.HIT_PENDING:
+            if self._gds_active_req != req_context.req_id:
+                return LookupResult.HIT
+            logger.debug(
+                "GDS-active req %s: skipping primary HIT, using GDS",
+                req_context.req_id,
+            )
+        elif primary_hit is LookupResult.HIT_PENDING:
             return LookupResult.HIT_PENDING
 
         any_retry = False
         for tier in self.secondary_tiers:
             result = tier.lookup(key, req_context)
             if result is LookupResult.HIT:
-                if self._gds_available and tier is self._gds_tier:
+                if tier is self._gds_tier:
                     req_id = req_context.req_id
-                    if self._gds_active_req is None or self._gds_active_req == req_id:
+                    if self._gds_active_req is None:
+                        self._gds_active_req = req_id
+                    if self._gds_active_req == req_id:
                         gds_set = self._gds_ready_keys.get(req_id)
                         if gds_set and key in gds_set:
                             return LookupResult.HIT
-                        if self._gds_active_req is None:
-                            self._gds_active_req = req_id
                         slot = self._gds_free_slots.pop()
                         self._gds_ready_keys.setdefault(req_id, set()).add(key)
                         self._gds_reserved_slots.setdefault(req_id, []).append(slot)
@@ -446,15 +451,10 @@ class TieringOffloadingManager(OffloadingManager):
                 return self._build_gds_spec(gds_keys, req_context.req_id)
             elif cpu_keys and not gds_keys:
                 return self.primary_tier.prepare_load(cpu_keys, req_context)
-            # Mixed: fall back to CPU path for all (rare in practice)
-            # GDS keys without CPU primary slots cannot go through CPU path,
-            # so we only load the CPU-ready keys here. The GDS keys will be
-            # retried on the next step after they fall out of _gds_ready_keys.
-            logger.warning(
-                "Mixed GDS/CPU keys for req %s; loading CPU keys only",
-                req_context.req_id,
-            )
-            return self.primary_tier.prepare_load(cpu_keys, req_context)
+            # Mixed state should not occur: the GDS-active request's
+            # primary-hit keys are redirected to GDS in lookup().
+            logger.error("Unexpected mixed GDS/CPU keys")
+            # TODO: handle properly
 
         return self.primary_tier.prepare_load(keys, req_context)
 
