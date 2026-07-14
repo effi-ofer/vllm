@@ -174,15 +174,19 @@ class GDSOffloadingHandler:
             vram_descs_data.append((addr, self._block_size_bytes, self._device_id))
         vram_descs = self._agent.get_xfer_descs(vram_descs_data, "VRAM")
 
-        file_xfer_descs = file_reg.trim()
+        file_xfer_descs = self._agent.get_xfer_descs(
+            [(0, gds_spec.block_size_bytes, fd) for fd in fds], "FILE"
+        )
 
         xfer_handle = self._agent.initialize_xfer(
             NIXL_READ, vram_descs, file_xfer_descs, "GDSAgent"
         )
         assert xfer_handle, f"GDS initialize_xfer failed for job {job_id}"
 
+        logger.debug(".... before transfer")
         state = self._agent.transfer(xfer_handle)
         assert state != "ERR", f"GDS transfer failed for job {job_id}"
+        logger.debug(".... after transfer")
 
         self._transfers[job_id] = _GDSTransferEntry(
             job_id=job_id,
