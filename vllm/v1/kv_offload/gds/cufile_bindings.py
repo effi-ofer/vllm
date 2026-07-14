@@ -23,7 +23,7 @@ logger = init_logger(__name__)
 
 # --- Constants ---
 
-CU_FILE_HANDLE_TYPE_OPAQUE_FD = 0
+CU_FILE_HANDLE_TYPE_OPAQUE_FD = 1
 CU_FILE_SUCCESS = 0
 
 
@@ -104,9 +104,12 @@ def _get_lib() -> ctypes.CDLL:
 
 def _check_error(err: CUfileError_t, func_name: str) -> None:
     if err.err != CU_FILE_SUCCESS:
+        try:
+            err_name = CUfileOpError(err.err).name
+        except ValueError:
+            err_name = f"UNKNOWN({err.err})"
         raise RuntimeError(
-            f"{func_name} failed: err={err.err} "
-            f"({CUfileOpError(err.err).name}), cu_err={err.cu_err}"
+            f"{func_name} failed: err={err.err} ({err_name}), cu_err={err.cu_err}"
         )
 
 

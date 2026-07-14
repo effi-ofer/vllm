@@ -4,7 +4,6 @@
 
 import ctypes
 import os
-from collections import deque
 from dataclasses import dataclass, field
 
 import torch
@@ -59,10 +58,9 @@ class _Transfer:
 class GDSOffloadingWorker(OffloadingWorker):
     """GPU<->NVMe transfers via NVIDIA cuFile async API.
 
-    Uses CUDA streams for ordering — cuFileReadAsync/cuFileWriteAsync
-    are enqueued on a stream and execute when the stream reaches them.
-    Completion is tracked via CUDA events, matching the CPU offloading
-    worker's design.
+    Each transfer gets its own CUDA stream so multiple I/O operations
+    overlap on the NVMe device (higher queue depth = higher throughput).
+    Completion is tracked via CUDA events.
     """
 
     def __init__(
@@ -106,9 +104,8 @@ class GDSOffloadingWorker(OffloadingWorker):
         self._event_pool: list[torch.Event] = []
         self._registered_streams: set[int] = set()
 
-        # In-flight transfers (FIFO order per direction)
-        self._store_transfers: deque[_Transfer] = deque()
-        self._load_transfers: deque[_Transfer] = deque()
+        # In-flight transfers — no ordering between them (overlapping I/O)
+        self._transfers: dict[int, _Transfer] = {}
 
     def _get_stream(self) -> torch.cuda.Stream:
         if self._stream_pool:
@@ -135,9 +132,6 @@ class GDSOffloadingWorker(OffloadingWorker):
 
         # Wait for GPU computation to finish before reading KV data
         stream.wait_stream(current_platform.current_stream())
-        # Serialize with previous transfer
-        if self._store_transfers:
-            stream.wait_event(self._store_transfers[-1].end_event)
 
         num_bytes, file_handles, pinned_params = self._enqueue_writes(
             stream, src_spec, dst_spec
@@ -145,19 +139,16 @@ class GDSOffloadingWorker(OffloadingWorker):
 
         with current_platform.stream(stream):
             start_event.record(stream)
-            # Async writes already enqueued above
             end_event.record(stream)
 
-        self._store_transfers.append(
-            _Transfer(
-                job_id=job_id,
-                stream=stream,
-                start_event=start_event,
-                end_event=end_event,
-                num_bytes=num_bytes,
-                file_handles=file_handles,
-                pinned_params=pinned_params,
-            )
+        self._transfers[job_id] = _Transfer(
+            job_id=job_id,
+            stream=stream,
+            start_event=start_event,
+            end_event=end_event,
+            num_bytes=num_bytes,
+            file_handles=file_handles,
+            pinned_params=pinned_params,
         )
         return True
 
@@ -170,10 +161,6 @@ class GDSOffloadingWorker(OffloadingWorker):
         start_event = self._get_event()
         end_event = self._get_event()
 
-        # Serialize with previous transfer
-        if self._load_transfers:
-            stream.wait_event(self._load_transfers[-1].end_event)
-
         num_bytes, file_handles, pinned_params = self._enqueue_reads(
             stream, src_spec, dst_spec
         )
@@ -182,24 +169,22 @@ class GDSOffloadingWorker(OffloadingWorker):
             start_event.record(stream)
             end_event.record(stream)
 
-        self._load_transfers.append(
-            _Transfer(
-                job_id=job_id,
-                stream=stream,
-                start_event=start_event,
-                end_event=end_event,
-                num_bytes=num_bytes,
-                file_handles=file_handles,
-                pinned_params=pinned_params,
-            )
+        self._transfers[job_id] = _Transfer(
+            job_id=job_id,
+            stream=stream,
+            start_event=start_event,
+            end_event=end_event,
+            num_bytes=num_bytes,
+            file_handles=file_handles,
+            pinned_params=pinned_params,
         )
         return True
 
     def get_finished(self) -> list[TransferResult]:
         results: list[TransferResult] = []
-        for transfers in (self._store_transfers, self._load_transfers):
-            while transfers and transfers[0].end_event.query():
-                t = transfers.popleft()
+        finished_ids: list[int] = []
+        for job_id, t in self._transfers.items():
+            if t.end_event.query():
                 elapsed = t.start_event.elapsed_time(t.end_event) * 1e-3
                 results.append(
                     TransferResult(
@@ -209,31 +194,31 @@ class GDSOffloadingWorker(OffloadingWorker):
                         transfer_time=elapsed,
                     )
                 )
-                # Close file handles now that transfer is done
                 for handle, fd in t.file_handles:
                     cuFileHandleDeregister(handle)
                     os.close(fd)
-                # Return stream/events to pool
                 self._stream_pool.append(t.stream)
                 self._event_pool.append(t.start_event)
                 self._event_pool.append(t.end_event)
+                finished_ids.append(job_id)
+        for job_id in finished_ids:
+            del self._transfers[job_id]
         return results
 
     def wait(self, job_ids: set[int]) -> None:
-        for transfers in (self._store_transfers, self._load_transfers):
-            for t in transfers:
-                if t.job_id in job_ids:
-                    t.end_event.synchronize()
+        for job_id in job_ids:
+            t = self._transfers.get(job_id)
+            if t is not None:
+                t.end_event.synchronize()
 
     def shutdown(self) -> None:
         # Wait for all in-flight transfers
-        for transfers in (self._store_transfers, self._load_transfers):
-            while transfers:
-                t = transfers.popleft()
-                t.end_event.synchronize()
-                for handle, fd in t.file_handles:
-                    cuFileHandleDeregister(handle)
-                    os.close(fd)
+        for t in self._transfers.values():
+            t.end_event.synchronize()
+            for handle, fd in t.file_handles:
+                cuFileHandleDeregister(handle)
+                os.close(fd)
+        self._transfers.clear()
 
         # Deregister streams
         for stream_ptr in self._registered_streams:
