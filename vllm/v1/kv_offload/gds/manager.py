@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 from typing_extensions import override
 
+from vllm.logger import init_logger
 from vllm.v1.kv_offload.base import (
     LoadStoreSpec,
     LookupResult,
@@ -18,6 +19,8 @@ from vllm.v1.kv_offload.base import (
     RequestOffloadingContext,
 )
 from vllm.v1.kv_offload.gds.common import GDSLoadStoreSpec
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -61,6 +64,9 @@ class GDSOffloadingManager(OffloadingManager):
             assert state is not None, f"Block {key!r} not found"
             assert state.is_ready, f"Block {key!r} not ready"
             state.ref_cnt += 1
+        logger.debug(
+            "prepare_load: %d keys, req=%s", len(list(keys)), req_context.req_id
+        )
         return GDSLoadStoreSpec(list(keys))
 
     @override
@@ -71,6 +77,9 @@ class GDSOffloadingManager(OffloadingManager):
     def complete_load(
         self, keys: Collection[OffloadKey], req_context: ReqContext
     ) -> None:
+        logger.debug(
+            "complete_load: %d keys, req=%s", len(list(keys)), req_context.req_id
+        )
         for key in keys:
             state = self._blocks.get(key)
             assert state is not None, f"Block {key!r} not found"
@@ -84,6 +93,12 @@ class GDSOffloadingManager(OffloadingManager):
         req_context: ReqContext,
     ) -> PrepareStoreOutput | None:
         keys_to_store = [k for k in keys if k not in self._blocks]
+        logger.debug(
+            "prepare_store: %d keys (%d new), req=%s",
+            len(list(keys)),
+            len(keys_to_store),
+            req_context.req_id,
+        )
         if not keys_to_store:
             return PrepareStoreOutput(
                 keys_to_store=[],
@@ -105,6 +120,12 @@ class GDSOffloadingManager(OffloadingManager):
         req_context: ReqContext,
         success: bool = True,
     ) -> None:
+        logger.debug(
+            "complete_store: %d keys, success=%s, req=%s",
+            len(list(keys)),
+            success,
+            req_context.req_id,
+        )
         stored_keys: list[OffloadKey] = []
         if success:
             for key in keys:
