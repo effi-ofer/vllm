@@ -84,25 +84,44 @@ class GDSOffloadingManager(CPUOffloadingManager):
         return GDSLoadStoreSpec(list(keys))
 
     @override
+    def prepare_load(
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+    ) -> LoadStoreSpec:
+        logger.debug(
+            "prepare_load: %d keys, req=%s",
+            len(list(keys)),
+            req_context.req_id,
+        )
+        return super().prepare_load(keys, req_context)
+
+    @override
     def prepare_store(
         self,
         keys: Collection[OffloadKey],
         req_context: ReqContext,
     ) -> PrepareStoreOutput | None:
         keys_to_store = [k for k in keys if self._policy.get(k) is None]
-        logger.debug(
-            "prepare_store: %d keys (%d new), req=%s",
-            len(list(keys)),
-            len(keys_to_store),
-            req_context.req_id,
-        )
         if not keys_to_store:
+            logger.debug(
+                "prepare_store: %d keys (0 new, 0 blocks), req=%s",
+                len(list(keys)),
+                req_context.req_id,
+            )
             return PrepareStoreOutput(
                 keys_to_store=[],
                 store_spec=GDSLoadStoreSpec([]),
                 evicted_keys=[],
             )
         blocks = self._allocate_blocks(keys_to_store)
+        logger.debug(
+            "prepare_store: %d keys (%d new, %d blocks), req=%s",
+            len(list(keys)),
+            len(keys_to_store),
+            len(blocks),
+            req_context.req_id,
+        )
         for key, block in zip(keys_to_store, blocks):
             self._policy.insert(key, block)
         store_spec = self._get_load_store_spec(keys_to_store, blocks)
@@ -111,3 +130,29 @@ class GDSOffloadingManager(CPUOffloadingManager):
             store_spec=store_spec,
             evicted_keys=[],
         )
+
+    @override
+    def complete_store(
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+        success: bool = True,
+    ) -> None:
+        logger.debug(
+            "complete_store: %d keys, success=%s, req=%s",
+            len(list(keys)),
+            success,
+            req_context.req_id,
+        )
+        super().complete_store(keys, req_context, success)
+
+    @override
+    def complete_load(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> None:
+        logger.debug(
+            "complete_load: %d keys, req=%s",
+            len(list(keys)),
+            req_context.req_id,
+        )
+        super().complete_load(keys, req_context)
