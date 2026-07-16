@@ -1,15 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""GDS offloading worker — direct GPU<->NVMe via cuFile async API."""
+"""GDS offloading worker — direct GPU<->NVMe via cuFile sync API."""
 
-import ctypes
 import os
+import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 import torch
 
 from vllm.logger import init_logger
-from vllm.platforms import current_platform
 from vllm.v1.kv_offload.base import (
     CanonicalKVCaches,
     GPULoadStoreSpec,
@@ -27,40 +27,31 @@ from vllm.v1.kv_offload.gds.cufile_bindings import (
     cuFileDriverOpen,
     cuFileHandleDeregister,
     cuFileHandleRegister,
-    cuFileReadAsync,
-    cuFileStreamDeregister,
-    cuFileStreamRegister,
-    cuFileWriteAsync,
+    cuFileRead,
+    cuFileWrite,
     open_for_gds,
 )
 
 logger = init_logger(__name__)
 
-
-def _get_cuda_stream_ptr(stream: torch.cuda.Stream) -> int:
-    """Get the raw CUstream pointer from a torch CUDA stream."""
-    return stream.cuda_stream
+DEFAULT_MAX_THREADS = 32
 
 
 @dataclass
 class _Transfer:
     job_id: int
-    stream: torch.cuda.Stream
-    start_event: torch.Event
-    end_event: torch.Event
+    futures: list[Future]
     num_bytes: int
-    # Keep file handles alive until transfer completes
+    start_time: float
     file_handles: list[tuple[CUfileHandle_t, int]] = field(default_factory=list)
-    # Keep ctypes arrays alive (async API reads them at execution time)
-    pinned_params: list = field(default_factory=list)
 
 
 class GDSOffloadingWorker(OffloadingWorker):
-    """GPU<->NVMe transfers via NVIDIA cuFile async API.
+    """GPU<->NVMe transfers via NVIDIA cuFile synchronous API.
 
-    Each transfer gets its own CUDA stream so multiple I/O operations
+    Each file's I/O is submitted to a thread pool so multiple operations
     overlap on the NVMe device (higher queue depth = higher throughput).
-    Completion is tracked via CUDA events.
+    Completion is tracked via futures.
     """
 
     def __init__(
@@ -68,6 +59,7 @@ class GDSOffloadingWorker(OffloadingWorker):
         kv_caches: CanonicalKVCaches,
         block_size_factor: int,
         file_mapper: FileMapper,
+        max_io_threads: int = DEFAULT_MAX_THREADS,
     ):
         self._file_mapper = file_mapper
         self._block_size_factor = block_size_factor
@@ -99,56 +91,29 @@ class GDSOffloadingWorker(OffloadingWorker):
                 size / 1e9,
             )
 
-        # Stream and event pools
-        self._stream_pool: list[torch.cuda.Stream] = []
-        self._event_pool: list[torch.Event] = []
-        self._registered_streams: set[int] = set()
+        # Thread pool for sync cuFile I/O
+        self._pool = ThreadPoolExecutor(max_workers=max_io_threads)
+        logger.info("GDS worker thread pool: max_workers=%d", max_io_threads)
 
-        # In-flight transfers — no ordering between them (overlapping I/O)
+        # In-flight transfers
         self._transfers: dict[int, _Transfer] = {}
-
-    def _get_stream(self) -> torch.cuda.Stream:
-        if self._stream_pool:
-            return self._stream_pool.pop()
-        stream = current_platform.Stream()
-        stream_ptr = _get_cuda_stream_ptr(stream)
-        cuFileStreamRegister(stream_ptr)
-        self._registered_streams.add(stream_ptr)
-        return stream
-
-    def _get_event(self) -> torch.Event:
-        if self._event_pool:
-            return self._event_pool.pop()
-        return torch.Event(enable_timing=True)
 
     def submit_store(
         self, job_id: int, src_spec: GPULoadStoreSpec, dst_spec: LoadStoreSpec
     ) -> bool:
         assert isinstance(dst_spec, GDSLoadStoreSpec)
 
-        stream = self._get_stream()
-        start_event = self._get_event()
-        end_event = self._get_event()
-
         # Wait for GPU computation to finish before reading KV data
-        stream.wait_stream(current_platform.current_stream())
+        torch.cuda.current_stream().synchronize()
 
-        num_bytes, file_handles, pinned_params = self._enqueue_writes(
-            stream, src_spec, dst_spec
-        )
-
-        with current_platform.stream(stream):
-            start_event.record(stream)
-            end_event.record(stream)
+        futures, num_bytes, file_handles = self._submit_writes(src_spec, dst_spec)
 
         self._transfers[job_id] = _Transfer(
             job_id=job_id,
-            stream=stream,
-            start_event=start_event,
-            end_event=end_event,
+            futures=futures,
             num_bytes=num_bytes,
+            start_time=time.perf_counter(),
             file_handles=file_handles,
-            pinned_params=pinned_params,
         )
         return True
 
@@ -157,26 +122,14 @@ class GDSOffloadingWorker(OffloadingWorker):
     ) -> bool:
         assert isinstance(src_spec, GDSLoadStoreSpec)
 
-        stream = self._get_stream()
-        start_event = self._get_event()
-        end_event = self._get_event()
-
-        num_bytes, file_handles, pinned_params = self._enqueue_reads(
-            stream, src_spec, dst_spec
-        )
-
-        with current_platform.stream(stream):
-            start_event.record(stream)
-            end_event.record(stream)
+        futures, num_bytes, file_handles = self._submit_reads(src_spec, dst_spec)
 
         self._transfers[job_id] = _Transfer(
             job_id=job_id,
-            stream=stream,
-            start_event=start_event,
-            end_event=end_event,
+            futures=futures,
             num_bytes=num_bytes,
+            start_time=time.perf_counter(),
             file_handles=file_handles,
-            pinned_params=pinned_params,
         )
         return True
 
@@ -184,8 +137,11 @@ class GDSOffloadingWorker(OffloadingWorker):
         results: list[TransferResult] = []
         finished_ids: list[int] = []
         for job_id, t in self._transfers.items():
-            if t.end_event.query():
-                elapsed = t.start_event.elapsed_time(t.end_event) * 1e-3
+            if all(f.done() for f in t.futures):
+                # Propagate exceptions from threads
+                for f in t.futures:
+                    f.result()
+                elapsed = time.perf_counter() - t.start_time
                 results.append(
                     TransferResult(
                         job_id=t.job_id,
@@ -197,9 +153,6 @@ class GDSOffloadingWorker(OffloadingWorker):
                 for handle, fd in t.file_handles:
                     cuFileHandleDeregister(handle)
                     os.close(fd)
-                self._stream_pool.append(t.stream)
-                self._event_pool.append(t.start_event)
-                self._event_pool.append(t.end_event)
                 finished_ids.append(job_id)
         for job_id in finished_ids:
             del self._transfers[job_id]
@@ -209,26 +162,20 @@ class GDSOffloadingWorker(OffloadingWorker):
         for job_id in job_ids:
             t = self._transfers.get(job_id)
             if t is not None:
-                t.end_event.synchronize()
+                for f in t.futures:
+                    f.result()
 
     def shutdown(self) -> None:
         # Wait for all in-flight transfers
         for t in self._transfers.values():
-            t.end_event.synchronize()
+            for f in t.futures:
+                f.result()
             for handle, fd in t.file_handles:
                 cuFileHandleDeregister(handle)
                 os.close(fd)
         self._transfers.clear()
 
-        # Deregister streams
-        for stream_ptr in self._registered_streams:
-            try:
-                cuFileStreamDeregister(stream_ptr)
-            except RuntimeError as e:
-                logger.warning("cuFileStreamDeregister failed: %s", e)
-        self._registered_streams.clear()
-        self._stream_pool.clear()
-        self._event_pool.clear()
+        self._pool.shutdown(wait=True)
 
         # Deregister GPU buffers
         for ptr, _size in self._registered_buffers:
@@ -244,19 +191,17 @@ class GDSOffloadingWorker(OffloadingWorker):
             logger.warning("cuFileDriverClose failed: %s", e)
         logger.info("GDS worker shut down")
 
-    # --- Internal: enqueue async cuFile operations ---
+    # --- Internal: submit sync cuFile operations to thread pool ---
 
-    def _enqueue_writes(
+    def _submit_writes(
         self,
-        stream: torch.cuda.Stream,
         src_spec: GPULoadStoreSpec,
         dst_spec: GDSLoadStoreSpec,
-    ) -> tuple[int, list[tuple[CUfileHandle_t, int]], list]:
-        """Enqueue cuFileWriteAsync ops on the stream for each block."""
+    ) -> tuple[list[Future], int, list[tuple[CUfileHandle_t, int]]]:
+        """Submit cuFileWrite tasks to the thread pool, one per file."""
         file_handles: list[tuple[CUfileHandle_t, int]] = []
-        pinned_params: list = []
+        futures: list[Future] = []
         total_bytes = 0
-        stream_ptr = _get_cuda_stream_ptr(stream)
 
         group_sizes = src_spec.group_sizes
         block_indices = src_spec.block_indices
@@ -288,6 +233,9 @@ class GDSOffloadingWorker(OffloadingWorker):
                 handle = cuFileHandleRegister(fd)
                 file_handles.append((handle, fd))
 
+                # Build the list of (base_ptr, page_size, file_offset, buf_offset)
+                # for all blocks in this file
+                write_ops: list[tuple[int, int, int, int]] = []
                 file_offset = 0
                 for data_ref in group_data_refs:
                     t_idx = data_ref.tensor_idx
@@ -298,38 +246,25 @@ class GDSOffloadingWorker(OffloadingWorker):
 
                     for block_id in gpu_blk_ids:
                         buf_offset = int(block_id) * row_stride
-                        params = self._make_async_params(
-                            page_size, file_offset, buf_offset
-                        )
-                        pinned_params.append(params)
-                        size_p, foff_p, boff_p, result_p = params
-
-                        cuFileWriteAsync(
-                            handle,
-                            base_ptr,
-                            size_p,
-                            foff_p,
-                            boff_p,
-                            result_p,
-                            stream_ptr,
-                        )
+                        write_ops.append((base_ptr, page_size, file_offset, buf_offset))
                         total_bytes += page_size
                         file_offset += page_size
 
-            gpu_block_offset += group_size
-        return total_bytes, file_handles, pinned_params
+                future = self._pool.submit(self._do_file_writes, handle, write_ops)
+                futures.append(future)
 
-    def _enqueue_reads(
+            gpu_block_offset += group_size
+        return futures, total_bytes, file_handles
+
+    def _submit_reads(
         self,
-        stream: torch.cuda.Stream,
         src_spec: GDSLoadStoreSpec,
         dst_spec: GPULoadStoreSpec,
-    ) -> tuple[int, list[tuple[CUfileHandle_t, int]], list]:
-        """Enqueue cuFileReadAsync ops on the stream for each block."""
+    ) -> tuple[list[Future], int, list[tuple[CUfileHandle_t, int]]]:
+        """Submit cuFileRead tasks to the thread pool, one per file."""
         file_handles: list[tuple[CUfileHandle_t, int]] = []
-        pinned_params: list = []
+        futures: list[Future] = []
         total_bytes = 0
-        stream_ptr = _get_cuda_stream_ptr(stream)
 
         group_sizes = dst_spec.group_sizes
         block_indices = dst_spec.block_indices
@@ -360,6 +295,8 @@ class GDSOffloadingWorker(OffloadingWorker):
                 handle = cuFileHandleRegister(fd)
                 file_handles.append((handle, fd))
 
+                # Build the list of (base_ptr, page_size, file_offset, buf_offset)
+                read_ops: list[tuple[int, int, int, int]] = []
                 file_offset = 0
                 for data_ref in group_data_refs:
                     t_idx = data_ref.tensor_idx
@@ -370,36 +307,34 @@ class GDSOffloadingWorker(OffloadingWorker):
 
                     for block_id in gpu_blk_ids:
                         buf_offset = int(block_id) * row_stride
-                        params = self._make_async_params(
-                            page_size, file_offset, buf_offset
-                        )
-                        pinned_params.append(params)
-                        size_p, foff_p, boff_p, result_p = params
-
-                        cuFileReadAsync(
-                            handle,
-                            base_ptr,
-                            size_p,
-                            foff_p,
-                            boff_p,
-                            result_p,
-                            stream_ptr,
-                        )
+                        read_ops.append((base_ptr, page_size, file_offset, buf_offset))
                         total_bytes += page_size
                         file_offset += page_size
 
+                future = self._pool.submit(self._do_file_reads, handle, read_ops)
+                futures.append(future)
+
             gpu_block_offset += group_size
-        return total_bytes, file_handles, pinned_params
+        return futures, total_bytes, file_handles
 
     @staticmethod
-    def _make_async_params(size: int, file_offset: int, buf_offset: int) -> tuple:
-        """Create ctypes parameter arrays for cuFile async calls.
+    def _do_file_writes(
+        handle: CUfileHandle_t,
+        ops: list[tuple[int, int, int, int]],
+    ) -> None:
+        """Execute sequential cuFileWrite calls for one file."""
+        for base_ptr, size, file_offset, buf_offset in ops:
+            ret = cuFileWrite(handle, base_ptr, size, file_offset, buf_offset)
+            if ret != size:
+                raise RuntimeError(f"cuFileWrite short write: {ret}/{size}")
 
-        The async API takes pointers that are read at stream execution
-        time, so these must remain alive until the transfer completes.
-        """
-        size_arr = (ctypes.c_size_t * 1)(size)
-        foff_arr = (ctypes.c_ssize_t * 1)(file_offset)
-        boff_arr = (ctypes.c_ssize_t * 1)(buf_offset)
-        result_arr = (ctypes.c_ssize_t * 1)(0)
-        return size_arr, foff_arr, boff_arr, result_arr
+    @staticmethod
+    def _do_file_reads(
+        handle: CUfileHandle_t,
+        ops: list[tuple[int, int, int, int]],
+    ) -> None:
+        """Execute sequential cuFileRead calls for one file."""
+        for base_ptr, size, file_offset, buf_offset in ops:
+            ret = cuFileRead(handle, base_ptr, size, file_offset, buf_offset)
+            if ret != size:
+                raise RuntimeError(f"cuFileRead short read: {ret}/{size}")
