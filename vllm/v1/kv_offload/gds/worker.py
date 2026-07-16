@@ -211,9 +211,7 @@ class GDSOffloadingWorker(OffloadingWorker):
                 handle = cuFileHandleRegister(fd)
                 file_handles.append((handle, fd))
 
-                # Build the list of (base_ptr, page_size, file_offset, buf_offset)
-                # for all blocks in this file
-                write_ops: list[tuple[int, int, int, int]] = []
+                write_ops: list[tuple[int, int, int]] = []
                 file_offset = 0
                 for data_ref in group_data_refs:
                     t_idx = data_ref.tensor_idx
@@ -223,8 +221,8 @@ class GDSOffloadingWorker(OffloadingWorker):
                     row_stride = gpu_tensor.stride(0)
 
                     for block_id in gpu_blk_ids:
-                        buf_offset = int(block_id) * row_stride
-                        write_ops.append((base_ptr, page_size, file_offset, buf_offset))
+                        dev_ptr = base_ptr + int(block_id) * row_stride
+                        write_ops.append((dev_ptr, page_size, file_offset))
                         total_bytes += page_size
                         file_offset += page_size
 
@@ -273,8 +271,7 @@ class GDSOffloadingWorker(OffloadingWorker):
                 handle = cuFileHandleRegister(fd)
                 file_handles.append((handle, fd))
 
-                # Build the list of (base_ptr, page_size, file_offset, buf_offset)
-                read_ops: list[tuple[int, int, int, int]] = []
+                read_ops: list[tuple[int, int, int]] = []
                 file_offset = 0
                 for data_ref in group_data_refs:
                     t_idx = data_ref.tensor_idx
@@ -284,8 +281,8 @@ class GDSOffloadingWorker(OffloadingWorker):
                     row_stride = gpu_tensor.stride(0)
 
                     for block_id in gpu_blk_ids:
-                        buf_offset = int(block_id) * row_stride
-                        read_ops.append((base_ptr, page_size, file_offset, buf_offset))
+                        dev_ptr = base_ptr + int(block_id) * row_stride
+                        read_ops.append((dev_ptr, page_size, file_offset))
                         total_bytes += page_size
                         file_offset += page_size
 
@@ -298,21 +295,21 @@ class GDSOffloadingWorker(OffloadingWorker):
     @staticmethod
     def _do_file_writes(
         handle: CUfileHandle_t,
-        ops: list[tuple[int, int, int, int]],
+        ops: list[tuple[int, int, int]],
     ) -> None:
         """Execute sequential cuFileWrite calls for one file."""
-        for base_ptr, size, file_offset, buf_offset in ops:
-            ret = cuFileWrite(handle, base_ptr, size, file_offset, buf_offset)
+        for dev_ptr, size, file_offset in ops:
+            ret = cuFileWrite(handle, dev_ptr, size, file_offset)
             if ret != size:
                 raise RuntimeError(f"cuFileWrite short write: {ret}/{size}")
 
     @staticmethod
     def _do_file_reads(
         handle: CUfileHandle_t,
-        ops: list[tuple[int, int, int, int]],
+        ops: list[tuple[int, int, int]],
     ) -> None:
         """Execute sequential cuFileRead calls for one file."""
-        for base_ptr, size, file_offset, buf_offset in ops:
-            ret = cuFileRead(handle, base_ptr, size, file_offset, buf_offset)
+        for dev_ptr, size, file_offset in ops:
+            ret = cuFileRead(handle, dev_ptr, size, file_offset)
             if ret != size:
                 raise RuntimeError(f"cuFileRead short read: {ret}/{size}")
