@@ -20,7 +20,7 @@ from vllm.v1.kv_offload.gds.worker import GDSOffloadingWorker
 
 
 class GDSOffloadingSpec(CPUOffloadingSpec):
-    """Spec for GPU Direct Storage offloading via cuFile async API."""
+    """Spec for GPU Direct Storage offloading via cuFile sync API."""
 
     def __init__(self, vllm_config: VllmConfig, kv_cache_config: KVCacheConfig):
         # GDS doesn't need cpu_bytes_to_use but CPUOffloadingSpec requires it.
@@ -67,5 +67,6 @@ class GDSOffloadingSpec(CPUOffloadingSpec):
                 kv_caches=kv_caches,
                 block_size_factor=self.block_size_factor,
                 file_mapper=file_mapper,
+                max_io_threads=self.extra_config.get("gds_max_io_threads", 32),
             )
         return self._gds_worker
