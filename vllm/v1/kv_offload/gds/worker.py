@@ -267,6 +267,7 @@ class GDSOffloadingWorker(OffloadingWorker):
                 gpu_blk_ids = block_ids[start:end]
 
                 file_path = self._file_mapper.get_file_name(key)
+                logger.debug("file_path =%s", self._file_mapper.get_file_name(key))
                 fd = open_for_gds(file_path, os.O_RDONLY)
                 handle = cuFileHandleRegister(fd)
                 file_handles.append((handle, fd))
