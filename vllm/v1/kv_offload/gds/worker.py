@@ -21,8 +21,6 @@ from vllm.v1.kv_offload.file_mapper import FileMapper
 from vllm.v1.kv_offload.gds.common import GDSLoadStoreSpec
 from vllm.v1.kv_offload.gds.cufile_bindings import (
     CUfileHandle_t,
-    cuFileBufDeregister,
-    cuFileBufRegister,
     cuFileDriverClose,
     cuFileDriverOpen,
     cuFileHandleDeregister,
@@ -69,8 +67,7 @@ class GDSOffloadingWorker(OffloadingWorker):
         cuFileDriverOpen()
         logger.info("cuFile driver opened")
 
-        # Register GPU KV cache buffers with cuFile
-        self._registered_buffers: list[tuple[int, int]] = []
+        # Build views of KV cache tensors for block-level addressing
         self._gpu_tensors: list[torch.Tensor] = []
 
         for kv_cache_tensor in kv_caches.tensors:
@@ -79,17 +76,6 @@ class GDSOffloadingWorker(OffloadingWorker):
                 (-1, gpu_page_size_bytes)
             )
             self._gpu_tensors.append(gpu_tensor)
-
-            ptr = gpu_tensor.data_ptr()
-            size = gpu_tensor.numel() * gpu_tensor.element_size()
-            cuFileBufRegister(ptr, size)
-            self._registered_buffers.append((ptr, size))
-            logger.debug(
-                "Registered GPU buffer: ptr=0x%x size=%d (%.2f GB)",
-                ptr,
-                size,
-                size / 1e9,
-            )
 
         # Thread pool for sync cuFile I/O
         self._pool = ThreadPoolExecutor(max_workers=max_io_threads)
@@ -176,14 +162,6 @@ class GDSOffloadingWorker(OffloadingWorker):
         self._transfers.clear()
 
         self._pool.shutdown(wait=True)
-
-        # Deregister GPU buffers
-        for ptr, _size in self._registered_buffers:
-            try:
-                cuFileBufDeregister(ptr)
-            except RuntimeError as e:
-                logger.warning("cuFileBufDeregister failed: %s", e)
-        self._registered_buffers.clear()
 
         try:
             cuFileDriverClose()
