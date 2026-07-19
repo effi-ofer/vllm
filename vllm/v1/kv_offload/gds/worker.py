@@ -32,7 +32,7 @@ from vllm.v1.kv_offload.gds.cufile_bindings import (
 
 logger = init_logger(__name__)
 
-DEFAULT_MAX_THREADS = 32
+DEFAULT_MAX_THREADS = 400
 
 
 @dataclass
@@ -108,12 +108,64 @@ class GDSOffloadingWorker(OffloadingWorker):
     ) -> bool:
         assert isinstance(src_spec, GDSLoadStoreSpec)
 
-        futures, num_bytes, file_handles = self._submit_reads(src_spec, dst_spec)
+        file_handles: list[tuple[CUfileHandle_t, int]] = []
+        futures: list[Future] = []
+        total_bytes = 0
+
+        group_sizes = dst_spec.group_sizes
+        block_indices = dst_spec.block_indices
+        block_ids = dst_spec.block_ids
+
+        key_idx = 0
+        gpu_block_offset = 0
+        for group_size, block_idx, group_data_refs in zip(
+            group_sizes, block_indices, self._kv_cache_groups_data_refs
+        ):
+            if group_size == 0:
+                continue
+            n_offloaded = (
+                group_size + self._block_size_factor - 1
+            ) // self._block_size_factor
+            logger.debug("submit_load: n_offloaded=%d", n_offloaded)
+            for i in range(n_offloaded):
+                key = src_spec.keys[key_idx]
+                key_idx += 1
+                start = gpu_block_offset + i * self._block_size_factor
+                end = min(
+                    start + self._block_size_factor,
+                    gpu_block_offset + group_size,
+                )
+                gpu_blk_ids = block_ids[start:end]
+
+                file_path = self._file_mapper.get_file_name(key)
+                fd = open_for_gds(file_path, os.O_RDONLY)
+                handle = cuFileHandleRegister(fd)
+                file_handles.append((handle, fd))
+
+                read_ops: list[tuple[int, int, int]] = []
+                file_offset = 0
+                for data_ref in group_data_refs:
+                    t_idx = data_ref.tensor_idx
+                    gpu_tensor = self._gpu_tensors[t_idx]
+                    page_size = data_ref.page_size_bytes
+                    base_ptr = gpu_tensor.data_ptr()
+                    row_stride = gpu_tensor.stride(0)
+
+                    for block_id in gpu_blk_ids:
+                        dev_ptr = base_ptr + int(block_id) * row_stride
+                        read_ops.append((dev_ptr, page_size, file_offset))
+                        total_bytes += page_size
+                        file_offset += page_size
+
+                future = self._pool.submit(self._do_file_reads, handle, read_ops)
+                futures.append(future)
+
+            gpu_block_offset += group_size
 
         self._transfers[job_id] = _Transfer(
             job_id=job_id,
             futures=futures,
-            num_bytes=num_bytes,
+            num_bytes=total_bytes,
             start_time=time.perf_counter(),
             file_handles=file_handles,
         )
@@ -227,67 +279,6 @@ class GDSOffloadingWorker(OffloadingWorker):
                         file_offset += page_size
 
                 future = self._pool.submit(self._do_file_writes, handle, write_ops)
-                futures.append(future)
-
-            gpu_block_offset += group_size
-        return futures, total_bytes, file_handles
-
-    def _submit_reads(
-        self,
-        src_spec: GDSLoadStoreSpec,
-        dst_spec: GPULoadStoreSpec,
-    ) -> tuple[list[Future], int, list[tuple[CUfileHandle_t, int]]]:
-        """Submit cuFileRead tasks to the thread pool, one per file."""
-        file_handles: list[tuple[CUfileHandle_t, int]] = []
-        futures: list[Future] = []
-        total_bytes = 0
-
-        group_sizes = dst_spec.group_sizes
-        block_indices = dst_spec.block_indices
-        block_ids = dst_spec.block_ids
-
-        key_idx = 0
-        gpu_block_offset = 0
-        for group_size, block_idx, group_data_refs in zip(
-            group_sizes, block_indices, self._kv_cache_groups_data_refs
-        ):
-            if group_size == 0:
-                continue
-            n_offloaded = (
-                group_size + self._block_size_factor - 1
-            ) // self._block_size_factor
-            for i in range(n_offloaded):
-                key = src_spec.keys[key_idx]
-                key_idx += 1
-                start = gpu_block_offset + i * self._block_size_factor
-                end = min(
-                    start + self._block_size_factor,
-                    gpu_block_offset + group_size,
-                )
-                gpu_blk_ids = block_ids[start:end]
-
-                file_path = self._file_mapper.get_file_name(key)
-                logger.debug("file_path =%s", self._file_mapper.get_file_name(key))
-                fd = open_for_gds(file_path, os.O_RDONLY)
-                handle = cuFileHandleRegister(fd)
-                file_handles.append((handle, fd))
-
-                read_ops: list[tuple[int, int, int]] = []
-                file_offset = 0
-                for data_ref in group_data_refs:
-                    t_idx = data_ref.tensor_idx
-                    gpu_tensor = self._gpu_tensors[t_idx]
-                    page_size = data_ref.page_size_bytes
-                    base_ptr = gpu_tensor.data_ptr()
-                    row_stride = gpu_tensor.stride(0)
-
-                    for block_id in gpu_blk_ids:
-                        dev_ptr = base_ptr + int(block_id) * row_stride
-                        read_ops.append((dev_ptr, page_size, file_offset))
-                        total_bytes += page_size
-                        file_offset += page_size
-
-                future = self._pool.submit(self._do_file_reads, handle, read_ops)
                 futures.append(future)
 
             gpu_block_offset += group_size
