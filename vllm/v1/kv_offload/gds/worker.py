@@ -82,13 +82,17 @@ class GDSOffloadingWorker(OffloadingWorker):
 
             ptr = gpu_tensor.data_ptr()
             nbytes = gpu_tensor.numel() * gpu_tensor.element_size()
-            cuFileBufRegister(ptr, nbytes, 0)
-            self._registered_bufs.append(ptr)
             logger.info(
-                "Registered GPU buffer with cuFile: ptr=%#x size=%.1f MiB",
+                "Registering GPU buffer with cuFile: ptr=%#x size=%.1f MiB "
+                "device=%s aligned=%s",
                 ptr,
                 nbytes / (1 << 20),
+                gpu_tensor.device,
+                ptr % 4096 == 0 and nbytes % 4096 == 0,
             )
+            cuFileBufRegister(ptr, nbytes, 0)
+            self._registered_bufs.append(ptr)
+            logger.info("cuFileBufRegister succeeded")
 
         # Thread pool for sync cuFile I/O
         self._pool = ThreadPoolExecutor(max_workers=max_io_threads)
