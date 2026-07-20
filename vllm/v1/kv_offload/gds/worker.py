@@ -126,7 +126,6 @@ class GDSOffloadingWorker(OffloadingWorker):
             n_offloaded = (
                 group_size + self._block_size_factor - 1
             ) // self._block_size_factor
-            logger.debug("submit_load: n_offloaded=%d", n_offloaded)
             for i in range(n_offloaded):
                 key = src_spec.keys[key_idx]
                 key_idx += 1
@@ -157,6 +156,11 @@ class GDSOffloadingWorker(OffloadingWorker):
                         total_bytes += page_size
                         file_offset += page_size
 
+                logger.debug(
+                    "submit_load: n_offloaded=%d read_ops=%d",
+                    n_offloaded,
+                    len(read_ops),
+                )
                 future = self._pool.submit(self._do_file_reads, handle, read_ops)
                 futures.append(future)
 
