@@ -26,6 +26,20 @@ logger = init_logger(__name__)
 CU_FILE_HANDLE_TYPE_OPAQUE_FD = 1
 CU_FILE_SUCCESS = 0
 
+# Batch API constants
+CUFILE_BATCH = 1
+CUFILE_READ = 0
+CUFILE_WRITE = 1
+
+# Batch status flags
+CUFILE_WAITING = 0x01
+CUFILE_PENDING = 0x02
+CUFILE_INVALID = 0x04
+CUFILE_CANCELED = 0x08
+CUFILE_COMPLETE = 0x10
+CUFILE_TIMEOUT = 0x20
+CUFILE_FAILED = 0x40
+
 
 class CUfileOpError(IntEnum):
     CU_FILE_SUCCESS = 0
@@ -74,6 +88,42 @@ CUfileHandle_t = c_void_p
 
 # CUstream is an opaque pointer
 CUstream_t = c_void_p
+
+# Batch handle type
+CUfileBatchHandle_t = c_void_p
+
+
+class _BatchParams(Structure):
+    _fields_ = [
+        ("devPtr_base", c_void_p),
+        ("file_offset", c_ssize_t),  # off_t
+        ("devPtr_offset", c_ssize_t),  # off_t
+        ("size", c_size_t),
+    ]
+
+
+class _BatchUnion(Union):
+    _fields_ = [
+        ("batch", _BatchParams),
+    ]
+
+
+class CUfileIOParams_t(Structure):
+    _fields_ = [
+        ("mode", c_int),
+        ("u", _BatchUnion),
+        ("fh", CUfileHandle_t),
+        ("opcode", c_int),
+        ("cookie", c_void_p),
+    ]
+
+
+class CUfileIOEvents_t(Structure):
+    _fields_ = [
+        ("cookie", c_void_p),
+        ("status", c_int),
+        ("ret", c_ssize_t),
+    ]
 
 
 # --- Library loading ---
@@ -309,6 +359,71 @@ def cuFileWrite(
     if ret < 0:
         raise RuntimeError(f"cuFileWrite failed: ret={ret}")
     return ret
+
+
+# --- Batch API ---
+
+
+def cuFileBatchIOSetUp(nr: int) -> CUfileBatchHandle_t:
+    """Initialize a batch I/O context for nr operations."""
+    lib = _get_lib()
+    lib.cuFileBatchIOSetUp.restype = CUfileError_t
+    lib.cuFileBatchIOSetUp.argtypes = [POINTER(CUfileBatchHandle_t), c_uint]
+    batch_id = CUfileBatchHandle_t()
+    err = lib.cuFileBatchIOSetUp(ctypes.byref(batch_id), c_uint(nr))
+    _check_error(err, "cuFileBatchIOSetUp")
+    return batch_id
+
+
+def cuFileBatchIOSubmit(
+    batch_id: CUfileBatchHandle_t,
+    nr: int,
+    params: ctypes.Array,
+    flags: int = 0,
+) -> None:
+    """Submit nr batch I/O operations."""
+    lib = _get_lib()
+    lib.cuFileBatchIOSubmit.restype = CUfileError_t
+    lib.cuFileBatchIOSubmit.argtypes = [
+        CUfileBatchHandle_t,
+        c_uint,
+        POINTER(CUfileIOParams_t),
+        c_uint,
+    ]
+    err = lib.cuFileBatchIOSubmit(batch_id, c_uint(nr), params, c_uint(flags))
+    _check_error(err, "cuFileBatchIOSubmit")
+
+
+def cuFileBatchIOGetStatus(
+    batch_id: CUfileBatchHandle_t,
+    min_nr: int,
+    max_nr: int,
+    events: ctypes.Array,
+) -> int:
+    """Poll for completed I/Os. Returns number of events retrieved."""
+    lib = _get_lib()
+    lib.cuFileBatchIOGetStatus.restype = CUfileError_t
+    lib.cuFileBatchIOGetStatus.argtypes = [
+        CUfileBatchHandle_t,
+        c_uint,
+        POINTER(c_uint),
+        POINTER(CUfileIOEvents_t),
+        c_void_p,
+    ]
+    nr = c_uint(max_nr)
+    err = lib.cuFileBatchIOGetStatus(
+        batch_id, c_uint(min_nr), ctypes.byref(nr), events, None
+    )
+    _check_error(err, "cuFileBatchIOGetStatus")
+    return nr.value
+
+
+def cuFileBatchIODestroy(batch_id: CUfileBatchHandle_t) -> None:
+    """Destroy a batch I/O context."""
+    lib = _get_lib()
+    lib.cuFileBatchIODestroy.restype = None
+    lib.cuFileBatchIODestroy.argtypes = [CUfileBatchHandle_t]
+    lib.cuFileBatchIODestroy(batch_id)
 
 
 def open_for_gds(path: str, flags: int) -> int:
