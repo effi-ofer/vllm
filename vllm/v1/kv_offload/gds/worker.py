@@ -341,36 +341,31 @@ class GDSOffloadingWorker(OffloadingWorker):
         ops: list[tuple[int, int, int]],
         opcode: int,
     ) -> None:
-        """Execute batch cuFile I/O for one file, chunked to fit batch limits."""
-        MAX_BATCH = 128
-        for start in range(0, len(ops), MAX_BATCH):
-            chunk = ops[start : start + MAX_BATCH]
-            n = len(chunk)
-            params = (CUfileIOParams_t * n)()
-            for i, (dev_ptr, size, file_offset) in enumerate(chunk):
-                params[i].mode = CUFILE_BATCH
-                params[i].fh = handle
-                params[i].u.batch.devPtr_base = dev_ptr
-                params[i].u.batch.file_offset = file_offset
-                params[i].u.batch.devPtr_offset = 0
-                params[i].u.batch.size = size
-                params[i].opcode = opcode
+        """Execute batch cuFile I/O for one file."""
+        n = len(ops)
+        params = (CUfileIOParams_t * n)()
+        for i, (dev_ptr, size, file_offset) in enumerate(ops):
+            params[i].mode = CUFILE_BATCH
+            params[i].fh = handle
+            params[i].u.batch.devPtr_base = dev_ptr
+            params[i].u.batch.file_offset = file_offset
+            params[i].u.batch.devPtr_offset = 0
+            params[i].u.batch.size = size
+            params[i].opcode = opcode
 
-            batch_id = cuFileBatchIOSetUp(n)
-            try:
-                cuFileBatchIOSubmit(batch_id, n, params, 0)
-                events = (CUfileIOEvents_t * n)()
-                completed = 0
-                while completed < n:
-                    got = cuFileBatchIOGetStatus(batch_id, n - completed, n, events)
-                    for j in range(got):
-                        if events[j].status == CUFILE_FAILED:
-                            raise RuntimeError(
-                                f"cuFileBatchIO failed: ret={events[j].ret}"
-                            )
-                    completed += got
-            finally:
-                cuFileBatchIODestroy(batch_id)
+        batch_id = cuFileBatchIOSetUp(n)
+        try:
+            cuFileBatchIOSubmit(batch_id, n, params, 0)
+            events = (CUfileIOEvents_t * n)()
+            completed = 0
+            while completed < n:
+                got = cuFileBatchIOGetStatus(batch_id, n - completed, n, events)
+                for j in range(got):
+                    if events[j].status == CUFILE_FAILED:
+                        raise RuntimeError(f"cuFileBatchIO failed: ret={events[j].ret}")
+                completed += got
+        finally:
+            cuFileBatchIODestroy(batch_id)
 
     @staticmethod
     def _do_file_reads(
