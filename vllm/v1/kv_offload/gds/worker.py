@@ -20,23 +20,15 @@ from vllm.v1.kv_offload.base import (
 from vllm.v1.kv_offload.file_mapper import FileMapper
 from vllm.v1.kv_offload.gds.common import GDSLoadStoreSpec
 from vllm.v1.kv_offload.gds.cufile_bindings import (
-    CUFILE_BATCH,
-    CUFILE_FAILED,
-    CUFILE_READ,
-    CUFILE_WRITE,
     CUfileHandle_t,
-    CUfileIOEvents_t,
-    CUfileIOParams_t,
-    cuFileBatchIODestroy,
-    cuFileBatchIOGetStatus,
-    cuFileBatchIOSetUp,
-    cuFileBatchIOSubmit,
     cuFileBufDeregister,
     cuFileBufRegister,
     cuFileDriverClose,
     cuFileDriverOpen,
     cuFileHandleDeregister,
     cuFileHandleRegister,
+    cuFileRead,
+    cuFileWrite,
     open_for_gds,
 )
 
@@ -332,50 +324,19 @@ class GDSOffloadingWorker(OffloadingWorker):
         handle: CUfileHandle_t,
         ops: list[tuple[int, int, int]],
     ) -> None:
-        """Execute batch cuFileWrite for one file."""
-        GDSOffloadingWorker._do_batch_io(handle, ops, CUFILE_WRITE)
-
-    @staticmethod
-    def _do_batch_io(
-        handle: CUfileHandle_t,
-        ops: list[tuple[int, int, int]],
-        opcode: int,
-    ) -> None:
-        """Execute batch cuFile I/O for one file, chunked to 256 max."""
-        MAX_BATCH = 256
-        for start in range(0, len(ops), MAX_BATCH):
-            chunk = ops[start : start + MAX_BATCH]
-            n = len(chunk)
-            params = (CUfileIOParams_t * n)()
-            for i, (dev_ptr, size, file_offset) in enumerate(chunk):
-                params[i].mode = CUFILE_BATCH
-                params[i].fh = handle
-                params[i].u.batch.devPtr_base = dev_ptr
-                params[i].u.batch.file_offset = file_offset
-                params[i].u.batch.devPtr_offset = 0
-                params[i].u.batch.size = size
-                params[i].opcode = opcode
-
-            batch_id = cuFileBatchIOSetUp(n)
-            try:
-                cuFileBatchIOSubmit(batch_id, n, params, 0)
-                events = (CUfileIOEvents_t * n)()
-                completed = 0
-                while completed < n:
-                    got = cuFileBatchIOGetStatus(batch_id, n - completed, n, events)
-                    for j in range(got):
-                        if events[j].status == CUFILE_FAILED:
-                            raise RuntimeError(
-                                f"cuFileBatchIO failed: ret={events[j].ret}"
-                            )
-                    completed += got
-            finally:
-                cuFileBatchIODestroy(batch_id)
+        """Execute sequential cuFileWrite calls for one file."""
+        for dev_ptr, size, file_offset in ops:
+            ret = cuFileWrite(handle, dev_ptr, size, file_offset)
+            if ret != size:
+                raise RuntimeError(f"cuFileWrite short write: {ret}/{size}")
 
     @staticmethod
     def _do_file_reads(
         handle: CUfileHandle_t,
         ops: list[tuple[int, int, int]],
     ) -> None:
-        """Execute batch cuFileRead for one file."""
-        GDSOffloadingWorker._do_batch_io(handle, ops, CUFILE_READ)
+        """Execute sequential cuFileRead calls for one file."""
+        for dev_ptr, size, file_offset in ops:
+            ret = cuFileRead(handle, dev_ptr, size, file_offset)
+            if ret != size:
+                raise RuntimeError(f"cuFileRead short read: {ret}/{size}")
