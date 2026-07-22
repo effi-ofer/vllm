@@ -36,7 +36,12 @@ class GDSOffloadingManager(CPUOffloadingManager):
     persisted by previous sessions are discovered.
     """
 
-    def __init__(self, file_mapper: FileMapper, enable_events: bool = False):
+    def __init__(
+        self,
+        file_mapper: FileMapper,
+        enable_events: bool = False,
+        read_only: bool = False,
+    ):
         super().__init__(
             num_blocks=sys.maxsize,
             cache_policy="lru",
@@ -45,6 +50,7 @@ class GDSOffloadingManager(CPUOffloadingManager):
         )
         self.medium = GDSLoadStoreSpec.medium()
         self._file_mapper = file_mapper
+        self._read_only = read_only
 
     @override
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
@@ -102,6 +108,8 @@ class GDSOffloadingManager(CPUOffloadingManager):
         keys: Collection[OffloadKey],
         req_context: ReqContext,
     ) -> PrepareStoreOutput | None:
+        if self._read_only:
+            return None
         keys_to_store = [k for k in keys if self._policy.get(k) is None]
         if not keys_to_store:
             logger.debug(
