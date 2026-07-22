@@ -33,6 +33,7 @@ class GDSOffloadingSpec(CPUOffloadingSpec):
         super().__init__(vllm_config, kv_cache_config)
 
         self.gds_root_dir: str = self.extra_config.get("gds_root_dir", "/tmp/vllm_gds")
+        self.read_only: bool = bool(self.extra_config.get("read_only", False))
         self._gds_worker: GDSOffloadingWorker | None = None
 
     def _get_file_mapper(self) -> FileMapper:
@@ -47,6 +48,7 @@ class GDSOffloadingSpec(CPUOffloadingSpec):
             self._manager = GDSOffloadingManager(
                 file_mapper=self._get_file_mapper(),
                 enable_events=self.kv_events_config.enable_kv_cache_events,
+                read_only=self.read_only,
             )
         return self._manager
 
