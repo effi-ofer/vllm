@@ -114,7 +114,11 @@ class GDSOffloadingManager(CPUOffloadingManager):
             req_context.req_id,
         )
         if self._read_only:
-            return None
+            return PrepareStoreOutput(
+                keys_to_store=[],
+                store_spec=GDSLoadStoreSpec([]),
+                evicted_keys=[],
+            )
         keys_to_store = [k for k in keys if self._policy.get(k) is None]
         if not keys_to_store:
             logger.debug(
