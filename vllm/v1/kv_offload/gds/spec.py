@@ -40,6 +40,8 @@ class GDSOffloadingSpec(CPUOffloadingSpec):
         return FileMapper.from_offloading_spec(
             root_dir=self.gds_root_dir,
             offloading_spec=self,
+            gpu_blocks_per_file=self.block_size_factor,
+            parallel_agnostic=True,
         )
 
     @override
