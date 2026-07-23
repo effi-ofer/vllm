@@ -113,6 +113,11 @@ class GDSOffloadingWorker(OffloadingWorker):
     ) -> bool:
         assert isinstance(dst_spec, GDSLoadStoreSpec)
 
+        logger.debug(
+            "submit_store: job_id=%d",
+            job_id,
+        )
+
         # Wait for GPU computation to finish before reading KV data
         torch.cuda.current_stream().synchronize()
 
