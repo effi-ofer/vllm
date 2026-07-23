@@ -108,6 +108,11 @@ class GDSOffloadingManager(CPUOffloadingManager):
         keys: Collection[OffloadKey],
         req_context: ReqContext,
     ) -> PrepareStoreOutput | None:
+        logger.debug(
+            "prepare_store: %d keys, req=%s",
+            len(list(keys)),
+            req_context.req_id,
+        )
         if self._read_only:
             return None
         keys_to_store = [k for k in keys if self._policy.get(k) is None]
