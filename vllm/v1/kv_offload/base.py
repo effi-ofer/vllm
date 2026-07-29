@@ -440,6 +440,84 @@ class GPULoadStoreSpec(BlockIDsLoadStoreSpec):
         self.block_indices: Sequence[int] = block_indices
 
 
+# Alias: the scheduler still uses GPULoadStoreSpec; expose as DeviceLoadStoreSpec
+# for the new device-agnostic interface.
+DeviceLoadStoreSpec = GPULoadStoreSpec
+
+
+@dataclass
+class DevicePointers:
+    """Pre-resolved device memory pointers for a KV cache transfer.
+
+    Flat arrays in canonical order:
+        for each group:
+            for each data_ref in group:
+                for each block in group:
+                    ptrs[i], sizes[i]
+    """
+
+    ptrs: np.ndarray  # uint64, device pointers
+    sizes: np.ndarray  # uint64, byte sizes per op
+    group_block_counts: tuple[int, ...]  # device blocks per group
+    group_data_ref_counts: tuple[int, ...]  # data_refs per group
+    block_indices: tuple[int, ...]  # logical block offset per group
+    total_bytes: int
+
+
+def resolve_device_pointers(
+    device_spec: DeviceLoadStoreSpec,
+    kv_caches: "CanonicalKVCaches",
+) -> DevicePointers:
+    """Convert logical block IDs to device memory pointers.
+
+    Called at the OffloadingConnectorWorker boundary so that workers
+    receive pre-resolved pointers and don't need KV cache layout knowledge.
+    """
+    group_block_counts: list[int] = []
+    group_data_ref_counts: list[int] = []
+    total_ops = 0
+    for group_size, group_data_refs in zip(
+        device_spec.group_sizes, kv_caches.group_data_refs
+    ):
+        group_block_counts.append(group_size)
+        group_data_ref_counts.append(len(group_data_refs))
+        total_ops += group_size * len(group_data_refs)
+
+    ptrs = np.empty(total_ops, dtype=np.uint64)
+    sizes = np.empty(total_ops, dtype=np.uint64)
+    total_bytes = 0
+
+    offset = 0
+    block_offset = 0
+    for group_size, group_data_refs in zip(
+        device_spec.group_sizes, kv_caches.group_data_refs
+    ):
+        group_block_ids = device_spec.block_ids[
+            block_offset : block_offset + group_size
+        ]
+        for data_ref in group_data_refs:
+            tensor = kv_caches.tensors[data_ref.tensor_idx].tensor
+            base_ptr = tensor.data_ptr()
+            row_stride = tensor.stride(0)
+            page_size = data_ref.page_size_bytes
+
+            end = offset + group_size
+            ptrs[offset:end] = base_ptr + group_block_ids.astype(np.uint64) * row_stride
+            sizes[offset:end] = page_size
+            total_bytes += group_size * page_size
+            offset = end
+        block_offset += group_size
+
+    return DevicePointers(
+        ptrs=ptrs,
+        sizes=sizes,
+        group_block_counts=tuple(group_block_counts),
+        group_data_ref_counts=tuple(group_data_ref_counts),
+        block_indices=tuple(device_spec.block_indices),
+        total_bytes=total_bytes,
+    )
+
+
 @dataclass
 class CanonicalKVCacheTensor:
     """
@@ -498,20 +576,31 @@ class TransferResult:
     transfer_time: float | None = None
 
 
+# Polymorphic base type for the medium-side spec in TransferJob.
+# The scheduler uses this opaquely; the worker downcasts to the concrete type.
+OffloadingLoadStoreSpec = LoadStoreSpec
+
+
 class OffloadingWorker(ABC):
     """Runs in the worker process. Performs async KV transfers for ONE
-    offloaded medium (e.g. CPU). Direction is explicit via submit_store /
-    submit_load, so there is no (src_medium, dst_medium) routing."""
+    offloaded medium (e.g. CPU, filesystem). Direction is explicit via
+    submit_store / submit_load."""
 
     @abstractmethod
     def submit_store(
-        self, job_id: int, src_spec: GPULoadStoreSpec, dst_spec: LoadStoreSpec
+        self,
+        job_id: int,
+        device_ptrs: DevicePointers,
+        dst_spec: OffloadingLoadStoreSpec,
     ) -> bool:
-        """Async GPU -> offloaded medium."""
+        """Async device -> offloaded medium."""
 
     @abstractmethod
     def submit_load(
-        self, job_id: int, src_spec: LoadStoreSpec, dst_spec: GPULoadStoreSpec
+        self,
+        job_id: int,
+        src_spec: OffloadingLoadStoreSpec,
+        device_ptrs: DevicePointers,
     ) -> bool:
         """Async offloaded medium -> GPU."""
 

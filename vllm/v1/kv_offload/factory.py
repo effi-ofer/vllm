@@ -66,6 +66,6 @@ OffloadingSpecFactory.register_spec(
 )
 OffloadingSpecFactory.register_spec(
     "GDSOffloadingSpec",
-    "vllm.v1.kv_offload.gds.spec",
+    "vllm.v1.kv_offload.fs.gds.spec",
     "GDSOffloadingSpec",
 )
