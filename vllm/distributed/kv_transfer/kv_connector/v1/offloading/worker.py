@@ -25,10 +25,12 @@ from vllm.v1.kv_offload.base import (
     CanonicalKVCacheRef,
     CanonicalKVCaches,
     CanonicalKVCacheTensor,
+    DevicePointers,
     GPULoadStoreSpec,
     LoadStoreSpec,
     OffloadingSpec,
     OffloadingWorker,
+    resolve_device_pointers,
 )
 
 logger = init_logger(__name__)
@@ -54,7 +56,11 @@ class OffloadingConnectorWorker:
         self._connector_worker_meta = OffloadingWorkerMetadata()
 
     def _init_worker(self, kv_caches: CanonicalKVCaches) -> None:
+        self._kv_caches = kv_caches
         self.worker = self.spec.get_worker(kv_caches)
+
+    def _resolve_device_ptrs(self, device_spec: GPULoadStoreSpec) -> DevicePointers:
+        return resolve_device_pointers(device_spec, self._kv_caches)
 
     def register_kv_caches(
         self, kv_caches: dict[str, torch.Tensor | list[torch.Tensor]]
@@ -295,7 +301,8 @@ class OffloadingConnectorWorker:
         # Submit deferred stores from previous step (and jobs_to_flush above).
         for job_id, src_spec, dst_spec in self._unsubmitted_store_jobs:
             assert isinstance(src_spec, GPULoadStoreSpec)
-            success = self.worker.submit_store(job_id, src_spec, dst_spec)
+            device_ptrs = self._resolve_device_ptrs(src_spec)
+            success = self.worker.submit_store(job_id, device_ptrs, dst_spec)
             assert success
         self._unsubmitted_store_jobs.clear()
 
@@ -305,14 +312,17 @@ class OffloadingConnectorWorker:
     def start_kv_transfers(self, metadata: OffloadingConnectorMetadata):
         assert self.worker is not None
         for job_id, src_spec, dst_spec in self._unsubmitted_store_jobs:
-            success = self.worker.submit_store(job_id, src_spec, dst_spec)
+            assert isinstance(src_spec, GPULoadStoreSpec)
+            device_ptrs = self._resolve_device_ptrs(src_spec)
+            success = self.worker.submit_store(job_id, device_ptrs, dst_spec)
             assert success
         self._unsubmitted_store_jobs.clear()
 
         for job_id, entry in metadata.load_jobs.items():
             self._load_jobs[job_id] = entry.req_id
             assert isinstance(entry.dst_spec, GPULoadStoreSpec)
-            success = self.worker.submit_load(job_id, entry.src_spec, entry.dst_spec)
+            device_ptrs = self._resolve_device_ptrs(entry.dst_spec)
+            success = self.worker.submit_load(job_id, entry.src_spec, device_ptrs)
             assert success
 
     def prepare_store_kv(self, metadata: OffloadingConnectorMetadata):

@@ -18,7 +18,7 @@ from vllm.v1.kv_offload.base import (
     BlockIDsLoadStoreSpec,
     CanonicalKVCacheRef,
     CanonicalKVCaches,
-    GPULoadStoreSpec,
+    DevicePointers,
     LoadStoreSpec,
     OffloadingWorker,
     TransferResult,
@@ -173,56 +173,25 @@ class SingleDirectionOffloadingHandler:
 
     def __init__(
         self,
-        gpu_tensors: list[torch.Tensor],
         cpu_tensors: list[torch.Tensor],
         blocks_per_chunk: int,
         kv_cache_groups_data_refs: list[list[CanonicalKVCacheRef]],
         gpu_to_cpu: bool,
         mmap_region: SharedOffloadRegion | None = None,
     ):
-        """
-        Initialize a SingleDirectionOffloadingHandler.
-
-        Args:
-            gpu_tensors: list of GPU KV cache tensors.
-                Each of shape (num_gpu_blocks, gpu_page_size_bytes) with dtype int8.
-            cpu_tensors: list of CPU KV cache tensors.
-                Each of shape (num_cpu_blocks, cpu_page_size_bytes) with dtype int8.
-                Order should match gpu_tensors.
-            kv_cache_groups_data_refs: list of CanonicalKVCacheRef per group.
-            gpu_to_cpu: if True, transfer from GPU to CPU; otherwise CPU to GPU.
-        """
-        assert len(gpu_tensors) == len(cpu_tensors)
-        assert len(gpu_tensors) > 0
-
-        # assert input tensors are as expected
-        for gpu_tensor, cpu_tensor in zip(gpu_tensors, cpu_tensors):
-            assert gpu_tensor.dtype == torch.int8
-            assert gpu_tensor.ndim == 2
-            assert gpu_tensor.is_cuda or gpu_tensor.is_xpu
+        assert len(cpu_tensors) > 0
+        for cpu_tensor in cpu_tensors:
             assert cpu_tensor.dtype == torch.int8
             assert cpu_tensor.ndim == 2
             assert cpu_tensor.device.type == "cpu"
-            _, gpu_page_size = gpu_tensor.shape
-            _, cpu_page_size = cpu_tensor.shape
-            assert cpu_page_size == gpu_page_size * blocks_per_chunk
 
-        self.src_tensors: list[torch.Tensor] = (
-            gpu_tensors if gpu_to_cpu else cpu_tensors
-        )
-        self.dst_tensors: list[torch.Tensor] = (
-            cpu_tensors if gpu_to_cpu else gpu_tensors
-        )
+        self.cpu_tensors: list[torch.Tensor] = cpu_tensors
         self.gpu_to_cpu: bool = gpu_to_cpu
         self.kv_cache_groups_data_refs = kv_cache_groups_data_refs
         self._swap_blocks_batch = _select_swap_blocks_fn(
             kv_cache_groups_data_refs, gpu_to_cpu
         )
-
-        # GPU blocks may be smaller
-        # cpu_page_size = gpu_page_size * blocks_per_chunk.
-        self.src_blocks_per_chunk = 1 if self.gpu_to_cpu else blocks_per_chunk
-        self.dst_blocks_per_chunk = blocks_per_chunk if self.gpu_to_cpu else 1
+        self.cpu_blocks_per_chunk = blocks_per_chunk
 
         # mmap_region to clean up on shutdown (gpu_to_cpu handler owns it)
         self._mmap_region = mmap_region
@@ -238,53 +207,19 @@ class SingleDirectionOffloadingHandler:
         self._buffer_pool: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
 
     def transfer_async(
-        self, job_id: int, src_spec: LoadStoreSpec, dst_spec: LoadStoreSpec
+        self, job_id: int, device_ptrs: DevicePointers, cpu_spec: LoadStoreSpec
     ) -> bool:
-        assert isinstance(src_spec, BlockIDsLoadStoreSpec)
-        assert isinstance(dst_spec, BlockIDsLoadStoreSpec)
+        assert isinstance(cpu_spec, BlockIDsLoadStoreSpec)
+        cpu_blocks = cpu_spec.block_ids
+        assert cpu_blocks.ndim == 1
+        num_cpu_blocks = len(cpu_blocks)
 
-        src_blocks = src_spec.block_ids
-        dst_blocks = dst_spec.block_ids
-        assert src_blocks.ndim == 1
-        assert dst_blocks.ndim == 1
-
-        num_src_blocks = len(src_blocks)
-        num_dst_blocks = len(dst_blocks)
-
-        # There are 2 types of transfers:
-        # 1. GPU -> CPU
-        # 2. CPU -> GPU
-        #
-        # transfers are also to CPU blocks, EXCEPT MAYBE for the first and last block.
-        # i.e. the first and last CPU blocks in src_blocks can match against
-        # a smaller (byte-wise) set of GPU blocks in dst_blocks.
-        # In such cases, we may need to skip some gpu-sized sub-blocks,
-        # and start reading/writing from the middle of the first CPU block.
-        # If we have multiple KV cache groups (when using HMA with hybrid models),
-        # we may have a partial first/last CPU block per each group.
-        # The group_sizes parameter encodes the size of each group of blocks
-        # in the GPU dst_blocks.
-        # If group_sizes is None, we assume all blocks belong to a single group.
-        # The logical_offset parameter maps each group of blocks to its logical
-        # offset inside the request, counting in GPU blocks.
-        # This allows us to find the correct starting position
-        # in the matching first CPU block.
-
-        # extract group_sizes from the GPU spec
-        gpu_spec = src_spec if self.gpu_to_cpu else dst_spec
-        assert isinstance(gpu_spec, GPULoadStoreSpec)
-        group_sizes = gpu_spec.group_sizes
+        group_sizes = device_ptrs.group_block_counts
+        block_indices = device_ptrs.block_indices
         assert len(group_sizes) == len(self.kv_cache_groups_data_refs)
-
-        # extract block indices from the GPU spec
-        block_indices = gpu_spec.block_indices
         assert len(block_indices) == len(self.kv_cache_groups_data_refs)
 
-        num_copy_ops = 0
-        for group_size, group_data_refs in zip(
-            group_sizes, self.kv_cache_groups_data_refs
-        ):
-            num_copy_ops += group_size * len(group_data_refs)
+        num_copy_ops = len(device_ptrs.ptrs)
 
         # reuse a pooled buffer set, growing it if this transfer needs more room
         batch_src, batch_dst, batch_sizes = (
@@ -298,14 +233,18 @@ class SingleDirectionOffloadingHandler:
         src = batch_src[:num_copy_ops]
         dst = batch_dst[:num_copy_ops]
         sizes = batch_sizes[:num_copy_ops]
-        all_src = src.numpy()
-        all_dst = dst.numpy()
+
+        # Device side is pre-resolved
+        device_arr = src if self.gpu_to_cpu else dst
+        device_arr.numpy()[:] = device_ptrs.ptrs
+
+        # CPU side: resolve block_ids to CPU tensor pointers
+        cpu_arr = dst if self.gpu_to_cpu else src
+        all_cpu = cpu_arr.numpy()
         all_sizes = sizes.numpy()
 
-        src_offset = 0
-        dst_offset = 0
+        cpu_offset = 0
         op_idx = 0
-        # count total number of bytes copied
         num_transfer_bytes = 0
         for group_size, block_idx, group_data_refs in zip(
             group_sizes, block_indices, self.kv_cache_groups_data_refs
@@ -313,50 +252,33 @@ class SingleDirectionOffloadingHandler:
             if group_size == 0:
                 continue
 
-            src_logical_blocks_to_skip = block_idx % self.src_blocks_per_chunk
-            dst_logical_blocks_to_skip = block_idx % self.dst_blocks_per_chunk
-            src_logical_blocks_count = group_size + src_logical_blocks_to_skip
-            dst_logical_blocks_count = group_size + dst_logical_blocks_to_skip
+            cpu_logical_blocks_to_skip = block_idx % self.cpu_blocks_per_chunk
+            cpu_logical_blocks_count = group_size + cpu_logical_blocks_to_skip
+            cpu_blocks_count = cdiv(cpu_logical_blocks_count, self.cpu_blocks_per_chunk)
+            cpu_end_offset = cpu_offset + cpu_blocks_count
+            assert cpu_end_offset <= num_cpu_blocks
 
-            dst_blocks_count = cdiv(dst_logical_blocks_count, self.dst_blocks_per_chunk)
-            dst_end_offset = dst_offset + dst_blocks_count
-            assert dst_end_offset <= num_dst_blocks
-
-            src_blocks_count = cdiv(src_logical_blocks_count, self.src_blocks_per_chunk)
-            src_end_offset = src_offset + src_blocks_count
-            assert src_end_offset <= num_src_blocks
-
-            group_src = src_blocks[src_offset:src_end_offset]
-            group_dst = dst_blocks[dst_offset:dst_end_offset]
+            group_cpu = cpu_blocks[cpu_offset:cpu_end_offset]
 
             for data_ref in group_data_refs:
                 t_idx = data_ref.tensor_idx
                 end_idx = op_idx + group_size
 
                 compute_sub_block_ptrs(
-                    group_src,
-                    self.src_blocks_per_chunk,
-                    all_src[op_idx:end_idx],
-                    self.src_tensors[t_idx],
-                    skip_count=src_logical_blocks_to_skip,
-                )
-                compute_sub_block_ptrs(
-                    group_dst,
-                    self.dst_blocks_per_chunk,
-                    all_dst[op_idx:end_idx],
-                    self.dst_tensors[t_idx],
-                    skip_count=dst_logical_blocks_to_skip,
+                    group_cpu,
+                    self.cpu_blocks_per_chunk,
+                    all_cpu[op_idx:end_idx],
+                    self.cpu_tensors[t_idx],
+                    skip_count=cpu_logical_blocks_to_skip,
                 )
 
                 all_sizes[op_idx:end_idx] = data_ref.page_size_bytes
                 num_transfer_bytes += group_size * data_ref.page_size_bytes
                 op_idx = end_idx
 
-            src_offset = src_end_offset
-            dst_offset = dst_end_offset
+            cpu_offset = cpu_end_offset
 
-        assert src_offset == num_src_blocks
-        assert dst_offset == num_dst_blocks
+        assert cpu_offset == num_cpu_blocks
         assert op_idx == num_copy_ops
 
         stream = (
@@ -454,8 +376,7 @@ class SingleDirectionOffloadingHandler:
         self._stream_pool.clear()
         self._event_pool.clear()
         self._buffer_pool.clear()
-        self.src_tensors.clear()
-        self.dst_tensors.clear()
+        self.cpu_tensors.clear()
         if self._mmap_region is not None:
             self._mmap_region.cleanup()
             self._mmap_region = None
@@ -466,7 +387,8 @@ class CPUOffloadingWorker(OffloadingWorker):
 
     Composes two SingleDirectionOffloadingHandler instances (one for each
     direction) and exposes them through the explicit submit_store /
-    submit_load API.
+    submit_load API. Device pointer resolution is done externally;
+    this worker only resolves the CPU side.
     """
 
     def __init__(
@@ -481,13 +403,9 @@ class CPUOffloadingWorker(OffloadingWorker):
         if mmap_region is not None and pin_memory:
             pin_mmap_region(mmap_region)
 
-        gpu_tensors: list[torch.Tensor] = []
         cpu_tensors: list[torch.Tensor] = []
         for kv_cache_tensor in kv_caches.tensors:
             gpu_page_size_bytes = kv_cache_tensor.page_size_bytes
-            gpu_tensor = kv_cache_tensor.tensor.view(torch.int8).view(
-                (-1, gpu_page_size_bytes)
-            )
             cpu_page_size_bytes = gpu_page_size_bytes * blocks_per_chunk
 
             if mmap_region is not None:
@@ -508,11 +426,9 @@ class CPUOffloadingWorker(OffloadingWorker):
                     time.monotonic() - t0,
                 )
 
-            gpu_tensors.append(gpu_tensor)
             cpu_tensors.append(cpu_tensor)
 
         self._store_handler = SingleDirectionOffloadingHandler(
-            gpu_tensors=gpu_tensors,
             cpu_tensors=cpu_tensors,
             blocks_per_chunk=blocks_per_chunk,
             kv_cache_groups_data_refs=kv_caches.group_data_refs,
@@ -521,7 +437,6 @@ class CPUOffloadingWorker(OffloadingWorker):
         )
 
         self._load_handler = SingleDirectionOffloadingHandler(
-            gpu_tensors=gpu_tensors,
             cpu_tensors=cpu_tensors,
             blocks_per_chunk=blocks_per_chunk,
             kv_cache_groups_data_refs=kv_caches.group_data_refs,
@@ -529,16 +444,16 @@ class CPUOffloadingWorker(OffloadingWorker):
         )
 
     def submit_store(
-        self, job_id: int, src_spec: GPULoadStoreSpec, dst_spec: LoadStoreSpec
+        self, job_id: int, device_ptrs: DevicePointers, dst_spec: LoadStoreSpec
     ) -> bool:
-        """Async GPU -> CPU."""
-        return self._store_handler.transfer_async(job_id, src_spec, dst_spec)
+        """Async device -> CPU."""
+        return self._store_handler.transfer_async(job_id, device_ptrs, dst_spec)
 
     def submit_load(
-        self, job_id: int, src_spec: LoadStoreSpec, dst_spec: GPULoadStoreSpec
+        self, job_id: int, src_spec: LoadStoreSpec, device_ptrs: DevicePointers
     ) -> bool:
-        """Async CPU -> GPU."""
-        return self._load_handler.transfer_async(job_id, src_spec, dst_spec)
+        """Async CPU -> device."""
+        return self._load_handler.transfer_async(job_id, device_ptrs, src_spec)
 
     def get_finished(self) -> list[TransferResult]:
         return self._store_handler.get_finished() + self._load_handler.get_finished()
