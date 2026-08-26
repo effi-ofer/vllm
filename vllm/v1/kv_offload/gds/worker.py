@@ -94,6 +94,21 @@ class GDSOffloadingWorker(OffloadingWorker):
                     e,
                 )
 
+        test_buf = torch.zeros(4096, dtype=torch.int8, device="cuda:0")
+        test_path = os.path.join("/mnt/files-storage", ".gds_probe")
+        test_fd = open_for_gds(test_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC)
+        test_handle = cuFileHandleRegister(test_fd)
+        ret = cuFileWrite(test_handle, test_buf.data_ptr(), 4096, 0)
+        cuFileHandleDeregister(test_handle)
+        os.close(test_fd)
+        os.unlink(test_path)
+        if ret == 4096:
+            logger.info("GDS probe write OK (main thread)")
+        else:
+            logger.error("GDS probe write FAILED from main thread: ret=%d", ret)
+        del test_buf
+        time.sleep(3600)
+
         logger.info(
             "Registered %d/%d GPU buffers with cuFile (%.1f MiB each)",
             len(self._registered_bufs),
