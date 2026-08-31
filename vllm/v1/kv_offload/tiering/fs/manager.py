@@ -116,6 +116,7 @@ class FileSystemTierManager(SecondaryTierManager):
         n_write_threads: int = 16,
         enable_kv_events: bool = False,
         locality: str | None = None,
+        write_only: bool = False,
     ):
         """
         Args:
@@ -131,9 +132,12 @@ class FileSystemTierManager(SecondaryTierManager):
                 cache events are enabled globally (kv_events_config).
             locality: Whether this tier's storage is LOCAL or REMOTE relative
                 to the publishing vLLM instance.
+            write_only: If True, only store operations are performed.
+                Lookups always return MISS and loads are no-ops.
         """
         super().__init__(offloading_spec, primary_kv_view, tier_type)
         self.locality = Locality(locality) if locality is not None else None
+        self._write_only = write_only
 
         self.events: list[OffloadingEvent] | None = None
         if enable_kv_events:
@@ -208,6 +212,8 @@ class FileSystemTierManager(SecondaryTierManager):
 
     @override
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
+        if self._write_only:
+            return LookupResult.MISS
         result = self._lookup_manager.lookup(key, req_context)
         if result is None:
             return LookupResult.RETRY

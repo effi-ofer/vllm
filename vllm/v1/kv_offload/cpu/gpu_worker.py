@@ -21,6 +21,7 @@ from vllm.v1.kv_offload.base import (
     CanonicalKVCacheRef,
     CanonicalKVCaches,
     CanonicalPageMapping,
+    DevicePointers,
     GPULoadStoreSpec,
     LoadStoreSpec,
     OffloadingWorker,
@@ -823,16 +824,22 @@ class CPUOffloadingWorker(OffloadingWorker):
         )
 
     def submit_store(
-        self, job_id: int, src_spec: GPULoadStoreSpec, dst_spec: LoadStoreSpec
+        self, job_id: int, device_ptrs: DevicePointers, dst_spec: LoadStoreSpec
     ) -> bool:
         """Async GPU -> CPU."""
-        return self._store_handler.transfer_async(job_id, src_spec, dst_spec)
+        assert device_ptrs.gpu_spec is not None
+        return self._store_handler.transfer_async(
+            job_id, device_ptrs.gpu_spec, dst_spec
+        )
 
     def submit_load(
-        self, job_id: int, src_spec: LoadStoreSpec, dst_spec: GPULoadStoreSpec
+        self, job_id: int, src_spec: LoadStoreSpec, device_ptrs: DevicePointers
     ) -> bool:
         """Async CPU -> GPU."""
-        return self._load_handler.transfer_async(job_id, src_spec, dst_spec)
+        assert device_ptrs.gpu_spec is not None
+        return self._load_handler.transfer_async(
+            job_id, src_spec, device_ptrs.gpu_spec
+        )
 
     def get_finished(self) -> list[TransferResult]:
         return self._store_handler.get_finished() + self._load_handler.get_finished()
