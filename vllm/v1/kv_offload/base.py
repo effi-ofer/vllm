@@ -451,7 +451,6 @@ class GPULoadStoreSpec(BlockIDsLoadStoreSpec):
         self.block_indices: Sequence[int] = block_indices
 
 
-
 @dataclass
 class CanonicalKVCacheTensor:
     """
@@ -563,8 +562,6 @@ class DevicePointers:
     group_data_ref_counts: tuple[int, ...]  # data_refs per group
     block_indices: tuple[int, ...]  # logical block offset per group
     total_bytes: int
-    gpu_spec: "GPULoadStoreSpec | None" = None  # original spec for backends
-    # that need block IDs
 
 
 def resolve_device_pointers(
@@ -621,7 +618,6 @@ def resolve_device_pointers(
         group_data_ref_counts=tuple(len(refs) for refs in group_data_refs),
         block_indices=tuple(block_indices),
         total_bytes=total_bytes,
-        gpu_spec=device_spec,
     )
 
 
