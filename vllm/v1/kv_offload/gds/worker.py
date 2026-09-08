@@ -5,7 +5,6 @@
 import os
 
 from vllm.logger import init_logger
-from vllm.v1.kv_offload.base import CanonicalKVCaches
 from vllm.v1.kv_offload.file_mapper import FileMapper
 from vllm.v1.kv_offload.fs.worker import DEFAULT_MAX_THREADS, FSOffloadingWorker
 from vllm.v1.kv_offload.gds.cufile_bindings import (
@@ -38,7 +37,6 @@ class GDSOffloadingWorker(FSOffloadingWorker):
 
     def __init__(
         self,
-        kv_caches: CanonicalKVCaches,
         block_size_factor: int,
         file_mapper: FileMapper,
         max_io_threads: int = DEFAULT_MAX_THREADS,
@@ -52,24 +50,6 @@ class GDSOffloadingWorker(FSOffloadingWorker):
         cuFileDriverOpen()
         logger.info("cuFile driver opened")
         self._job_file_handles: dict[int, list[tuple]] = {}
-
-        # TODO: do we need to register?
-        # for kv_cache_tensor in kv_caches.tensors:
-        #    gpu_tensor = kv_cache_tensor.tensor
-        #    ptr = gpu_tensor.data_ptr()
-        #    # Register only the contiguous data footprint (num_blocks * page_size),
-        #    # ignoring row stride gaps.  This matches the cuFile BAR requirement
-        #    # for bounce-buffer mode; stride gaps are never DMA'd.
-        #    nbytes = gpu_tensor.shape[0] * kv_cache_tensor.page_size_bytes
-        #    try:
-        #        cuFileBufRegister(ptr, nbytes, 0)
-        #    except RuntimeError as e:
-        #        logger.info(
-        #            "cuFileBufRegister (probe): ptr=%#x size=%.1f GiB: %s",
-        #            ptr,
-        #            nbytes / (1 << 30),
-        #            e,
-        #        )
 
     def write_block(
         self, file_path: str, ops: list[tuple[int, int, int]]

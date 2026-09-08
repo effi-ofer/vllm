@@ -249,6 +249,16 @@ class SingleDirectionOffloadingHandler:
         gpu_to_cpu: bool,
         canonical_layout: bool = False,
     ):
+        """Initialize a SingleDirectionOffloadingHandler.
+
+        Args:
+            cpu_tensors: list of CPU KV cache tensors.
+                Each of shape (num_cpu_blocks, cpu_page_size_bytes) with dtype int8.
+            layer_refs_per_group: list of CanonicalKVCacheRef per group.
+            gpu_to_cpu: if True, transfer from GPU to CPU; otherwise CPU to GPU.
+            canonical_layout: if True, CPU pages use the canonical layout
+                described by the refs' mappings.
+        """
         assert len(cpu_tensors) > 0
 
         for cpu_tensor in cpu_tensors:

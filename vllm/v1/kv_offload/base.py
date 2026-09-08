@@ -561,7 +561,6 @@ class DevicePointers:
     group_block_counts: tuple[int, ...]  # device blocks per group
     group_data_ref_counts: tuple[int, ...]  # data_refs per group
     block_indices: tuple[int, ...]  # logical block offset per group
-    total_bytes: int
 
 
 def resolve_device_pointers(
@@ -589,7 +588,6 @@ def resolve_device_pointers(
 
     blk_offset = 0
     op_idx = 0
-    total_bytes = 0
 
     for group_size, data_refs in zip(group_sizes, group_data_refs):
         if group_size == 0:
@@ -604,7 +602,6 @@ def resolve_device_pointers(
                 base_ptr + group_block_ids.astype(np.uint64) * row_stride
             )
             sizes[op_idx:end_idx] = data_ref.page_size_bytes
-            total_bytes += group_size * data_ref.page_size_bytes
             op_idx = end_idx
         blk_offset += group_size
 
@@ -617,7 +614,6 @@ def resolve_device_pointers(
         group_block_counts=tuple(group_sizes),
         group_data_ref_counts=tuple(len(refs) for refs in group_data_refs),
         block_indices=tuple(block_indices),
-        total_bytes=total_bytes,
     )
 
 
