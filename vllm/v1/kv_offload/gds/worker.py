@@ -50,6 +50,7 @@ class GDSOffloadingWorker(FSOffloadingWorker):
         logger.info("cuFile driver opened")
 
     def write_block(self, file_path: str, ops: list[tuple[int, int, int]]) -> None:
+        logger.warning("write_block: %s (%d ops)", file_path, len(ops))
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
         fd = open_for_gds(file_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC)
         try:
@@ -65,6 +66,7 @@ class GDSOffloadingWorker(FSOffloadingWorker):
             os.close(fd)
 
     def read_block(self, file_path: str, ops: list[tuple[int, int, int]]) -> None:
+        logger.warning("read_block: %s (%d ops)", file_path, len(ops))
         fd = open_for_gds(file_path, os.O_RDONLY)
         try:
             handle = cuFileHandleRegister(fd)
