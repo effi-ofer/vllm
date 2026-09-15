@@ -84,10 +84,7 @@ class GDSOffloadingSpec(CPUOffloadingSpec):
         if not self._gds_worker:
             if not current_platform.is_cuda_alike():
                 raise RuntimeError("GDS offloading requires a CUDA-capable GPU.")
-            file_mapper = FileMapper.from_offloading_spec(
-                root_dir=self.gds_root_dir,
-                offloading_spec=self,
-            )
+            file_mapper = self._get_file_mapper()
             self._gds_worker = GDSOffloadingWorker(
                 block_size_factor=self.block_size_factor,
                 file_mapper=file_mapper,
