@@ -111,7 +111,11 @@ class GDSOffloadingWorker(FSOffloadingWorker):
                         idx = base + b
                         dev_ptr = int(device_ptrs.ptrs[idx])
                         size = int(device_ptrs.sizes[idx])
-                        ops.append((dev_ptr, size, file_offset))
+                        prev_ptr, prev_size, prev_off = ops[-1] if ops else (0, 0, 0)
+                        if ops and prev_ptr + prev_size == dev_ptr:
+                            ops[-1] = (prev_ptr, prev_size + size, prev_off)
+                        else:
+                            ops.append((dev_ptr, size, file_offset))
                         file_offset += size
                         total_bytes += size
 
