@@ -192,6 +192,7 @@ class FSOffloadingWorker(OffloadingWorker):
                             d * self._block_size_factor + file_blk_start + b
                         ) * blk_size
                         if ops and ops[-1][0] + ops[-1][1] == dev_ptr:
+                            logger.info("COALESCE!")
                             ops[-1] = (ops[-1][0], ops[-1][1] + size, ops[-1][2])
                         else:
                             ops.append((dev_ptr, size, file_offset))

@@ -70,6 +70,8 @@ class GDSOffloadingWorker(FSOffloadingWorker):
             handle = cuFileHandleRegister(fd)
             try:
                 for dev_ptr, size, file_offset in ops:
+                    if size > 64 * 1024:
+                        logger.info("read_block size=%d", size)
                     ret = cuFileRead(handle, dev_ptr, size, file_offset)
                     if ret != size:
                         raise RuntimeError(f"cuFileRead short read: {ret}/{size}")
