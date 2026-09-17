@@ -186,17 +186,16 @@ class FSOffloadingWorker(OffloadingWorker):
                     blk_size = int(device_ptrs.sizes[base])
                     for b in range(n_blks):
                         idx = base + b
+                        dev_ptr = int(device_ptrs.ptrs[idx])
+                        size = int(device_ptrs.sizes[idx])
                         file_offset = (
                             d * self._block_size_factor + file_blk_start + b
                         ) * blk_size
-                        ops.append(
-                            (
-                                int(device_ptrs.ptrs[idx]),
-                                int(device_ptrs.sizes[idx]),
-                                file_offset,
-                            )
-                        )
-                        total_bytes += int(device_ptrs.sizes[idx])
+                        if ops and ops[-1][0] + ops[-1][1] == dev_ptr:
+                            ops[-1] = (ops[-1][0], ops[-1][1] + size, ops[-1][2])
+                        else:
+                            ops.append((dev_ptr, size, file_offset))
+                        total_bytes += size
 
                 file_path = self._file_mapper.get_file_name(key)
                 futures.append(self._pool.submit(io_fn, file_path, ops))
