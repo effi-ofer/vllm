@@ -191,10 +191,7 @@ class FSOffloadingWorker(OffloadingWorker):
                         file_offset = (
                             d * self._block_size_factor + file_blk_start + b
                         ) * blk_size
-                        if ops and ops[-1][0] + ops[-1][1] == dev_ptr:
-                            ops[-1] = (ops[-1][0], ops[-1][1] + size, ops[-1][2])
-                        else:
-                            ops.append((dev_ptr, size, file_offset))
+                        ops.append((dev_ptr, size, file_offset))
                         total_bytes += size
 
                 file_path = self._file_mapper.get_file_name(key)
