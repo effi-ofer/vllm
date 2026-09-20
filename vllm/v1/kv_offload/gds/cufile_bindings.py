@@ -317,6 +317,14 @@ def cuFileRead(
     buf_offset: int = 0,
 ) -> int:
     """Synchronous read from file to GPU memory. Returns bytes read."""
+    if size > 65536:
+        logger.info(
+            "cuFileRead: dev_ptr=0x%x size=%d file_offset=%d buf_offset=%d",
+            dev_ptr,
+            size,
+            file_offset,
+            buf_offset,
+        )
     lib = _get_lib()
     lib.cuFileRead.restype = c_ssize_t
     lib.cuFileRead.argtypes = [CUfileHandle_t, c_void_p, c_size_t, c_ssize_t, c_ssize_t]
