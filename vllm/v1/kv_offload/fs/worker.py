@@ -31,7 +31,7 @@ class FSLoadStoreSpec(LoadStoreSpec):
         self.keys = keys
 
 
-DEFAULT_MAX_THREADS = 400
+DEFAULT_MAX_THREADS = 1
 
 
 @dataclass
@@ -193,7 +193,8 @@ class FSOffloadingWorker(OffloadingWorker):
                         ) * blk_size
                         if ops and ops[-1][0] + ops[-1][1] == dev_ptr:
                             ops[-1] = (ops[-1][0], ops[-1][1] + size, ops[-1][2])
-                            logger.info("COALESCE! size=%d", ops[-1][1])
+                            if not is_store:
+                                logger.info("COALESCE! size=%d", ops[-1][1])
                         else:
                             ops.append((dev_ptr, size, file_offset))
                         total_bytes += size
