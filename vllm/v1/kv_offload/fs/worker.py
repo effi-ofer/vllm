@@ -200,7 +200,7 @@ class FSOffloadingWorker(OffloadingWorker):
                         total_bytes += size
 
                 file_path = self._file_mapper.get_file_name(key)
-                futures.append(self._pool.submit(io_fn, file_path, ops))
+                io_fn(file_path, ops)
                 dev_blk += n_blks
 
         assert key_idx == len(keys)
