@@ -31,7 +31,7 @@ class FSLoadStoreSpec(LoadStoreSpec):
         self.keys = keys
 
 
-DEFAULT_MAX_THREADS = 200
+DEFAULT_MAX_THREADS = 400
 
 
 @dataclass
