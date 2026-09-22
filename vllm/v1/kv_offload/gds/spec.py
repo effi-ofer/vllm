@@ -88,6 +88,7 @@ class GDSOffloadingSpec(CPUOffloadingSpec):
             self._gds_worker = GDSOffloadingWorker(
                 block_size_factor=self.block_size_factor,
                 file_mapper=file_mapper,
+                kv_caches=kv_caches,
                 max_io_threads=self.extra_config.get("gds_max_io_threads", 32),
             )
         return self._gds_worker
