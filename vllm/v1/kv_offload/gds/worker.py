@@ -64,14 +64,14 @@ class GDSOffloadingWorker(FSOffloadingWorker):
             os.close(fd)
 
     def read_block(self, file_path: str, ops: list[tuple[int, int, int]]) -> None:
-        logger.warning("read_block: %s (%d ops)", file_path, len(ops))
+        # TODO logger.warning("read_block: %s (%d ops)", file_path, len(ops))
         fd = open_for_gds(file_path, os.O_RDONLY)
         try:
             handle = cuFileHandleRegister(fd)
             try:
                 for dev_ptr, size, file_offset in ops:
-                    if size > 64 * 1024:
-                        logger.info("read_block size=%d", size)
+                    # TODO if size > 64 * 1024:
+                    # TODO     logger.info("read_block size=%d", size)
                     ret = cuFileRead(handle, dev_ptr, size, file_offset)
                     if ret != size:
                         raise RuntimeError(f"cuFileRead short read: {ret}/{size}")
