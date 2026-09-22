@@ -5,12 +5,9 @@
 import os
 
 from vllm.logger import init_logger
-from vllm.v1.kv_offload.base import CanonicalKVCaches
 from vllm.v1.kv_offload.file_mapper import FileMapper
 from vllm.v1.kv_offload.fs.worker import DEFAULT_MAX_THREADS, FSOffloadingWorker
 from vllm.v1.kv_offload.gds.cufile_bindings import (
-    cuFileBufDeregister,
-    cuFileBufRegister,
     cuFileDriverClose,
     cuFileDriverOpen,
     cuFileHandleDeregister,
@@ -39,7 +36,6 @@ class GDSOffloadingWorker(FSOffloadingWorker):
         self,
         block_size_factor: int,
         file_mapper: FileMapper,
-        kv_caches: CanonicalKVCaches,
         max_io_threads: int = DEFAULT_MAX_THREADS,
     ):
         super().__init__(
@@ -50,19 +46,6 @@ class GDSOffloadingWorker(FSOffloadingWorker):
 
         cuFileDriverOpen()
         logger.info("cuFile driver opened")
-
-        self._registered_bufs: list[int] = []
-        seen_ptrs: set[int] = set()
-        for t in kv_caches.tensors:
-            storage = t.tensor.untyped_storage()
-            ptr = storage.data_ptr()
-            if ptr in seen_ptrs:
-                continue
-            seen_ptrs.add(ptr)
-            size = storage.nbytes()
-            cuFileBufRegister(ptr, size)
-            self._registered_bufs.append(ptr)
-            logger.info("Registered GPU buffer: ptr=0x%x size=%d", ptr, size)
 
     def write_block(self, file_path: str, ops: list[tuple[int, int, int]]) -> None:
         logger.warning("write_block: %s (%d ops)", file_path, len(ops))
@@ -98,12 +81,6 @@ class GDSOffloadingWorker(FSOffloadingWorker):
             os.close(fd)
 
     def shutdown_backend(self) -> None:
-        for ptr in self._registered_bufs:
-            try:
-                cuFileBufDeregister(ptr)
-            except RuntimeError as e:
-                logger.warning("cuFileBufDeregister(0x%x) failed: %s", ptr, e)
-        self._registered_bufs.clear()
         try:
             cuFileDriverClose()
         except RuntimeError as e:
