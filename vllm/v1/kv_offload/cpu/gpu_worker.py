@@ -506,7 +506,7 @@ class SingleDirectionOffloadingHandler:
         cpu_offset = 0
         op_idx = 0
         num_transfer_bytes = 0
-        for g in device_ptrs.iter_groups(self.blocks_per_chunk):
+        for g in device_ptrs.iter_pointer_groups(self.blocks_per_chunk):
             cpu_end_offset = cpu_offset + g.n_chunks
             assert cpu_end_offset <= num_cpu_blocks
 

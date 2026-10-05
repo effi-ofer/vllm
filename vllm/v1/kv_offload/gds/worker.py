@@ -6,7 +6,7 @@ import os
 
 from vllm.logger import init_logger
 from vllm.v1.kv_offload.file_mapper import FileMapper
-from vllm.v1.kv_offload.fs.worker import DEFAULT_MAX_THREADS, FSOffloadingWorker
+from vllm.v1.kv_offload.fs.worker import DEFAULT_MAX_THREADS, ThreadPoolFSWorker
 from vllm.v1.kv_offload.gds.cufile_bindings import (
     cuFileDriverClose,
     cuFileDriverOpen,
@@ -20,7 +20,7 @@ from vllm.v1.kv_offload.gds.cufile_bindings import (
 logger = init_logger(__name__)
 
 
-class GDSOffloadingWorker(FSOffloadingWorker):
+class GDSOffloadingWorker(ThreadPoolFSWorker):
     """GPU<->NVMe transfers via NVIDIA cuFile synchronous API.
 
     Each file's I/O is submitted to a thread pool so multiple operations

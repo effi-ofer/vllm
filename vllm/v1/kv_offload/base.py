@@ -553,7 +553,9 @@ class DevicePointers:
     group_data_ref_counts: tuple[int, ...]  # data_refs per group
     block_indices: tuple[int, ...]  # logical block offset per group
 
-    def iter_groups(self, blocks_per_chunk: int) -> "Iterator[DevicePointerGroupInfo]":
+    def iter_pointer_groups(
+        self, blocks_per_chunk: int
+    ) -> "Iterator[DevicePointerGroupInfo]":
         """Iterate non-empty groups with pre-computed chunk/skip metadata."""
         dev_ptr_offset = 0
         for group_idx, (group_size, n_data_refs, block_idx) in enumerate(
